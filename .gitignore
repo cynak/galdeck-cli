@@ -1,5 +1,5 @@
 /target
 Cargo.lock.orig
 
-# Backups the daemon writes beside a config when the UI saves.
+# Backups galdeck-model writes beside a config file before rewriting it.
 *.toml.bak

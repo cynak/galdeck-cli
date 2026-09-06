@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# This repository builds on its own, deliberately. It is the floor of the
+# stack: nothing here knows the daemon or its configuration UI exists, so
+# there is only ever one checkout.
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # hidapi builds a C shim against these. `galdeck detect` opens the
+      # module over HID without the daemon, so the framework is a real
+      # dependency here and not just the daemon's.
+      - name: Install libudev headers
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      # --locked throughout: the framework is pinned by Cargo.lock, so an
+      # unnoticed update is how the MSRV job would start failing mysteriously.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libudev headers
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      # Pinned to the workspace's rust-version.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+  layering:
+    name: layering invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check
+        run: ./ci/layering.sh
+
+  publishable:
+    name: the crates can still be published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libudev headers
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The daemon depends on these crates from crates.io, so a change that
+      # makes them unpublishable breaks the other repository rather than this
+      # one -- a long way from the edit that caused it. `cargo package` is
+      # what catches a file the crate reaches for from outside its own
+      # directory: that compiles here, where the workspace root is two levels
+      # up, and fails for anyone who unpacks the published tarball.
+      #
+      # Only galdeck-model, for now. `cargo package` resolves every dependency
+      # against the real index, so galdeck-ipc cannot be packaged until
+      # galdeck-model has actually been published -- not even with
+      # --no-verify. Add it here once that has happened. Until then the rule
+      # it would enforce, that a path dependency also carries a version, is
+      # checked by ci/layering.sh instead.
+      - name: Package the shared crates
+        run: cargo package -p galdeck-model --locked

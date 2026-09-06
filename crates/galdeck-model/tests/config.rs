@@ -1,30 +1,9 @@
-//! The shipped example is the contract: if it stops loading, users' configs
-//! stop loading.
+//! What the validator says about a configuration, and how it says it.
+//!
+//! That the example the daemon ships is itself clean is asserted where that
+//! file lives, in the galdeck-daemon repository -- this crate does not have it.
 
 use galdeck_model::{Config, ParseError, Severity};
-
-const EXAMPLE: &str = include_str!("../../../config/galdeck.example.toml");
-
-#[test]
-fn parses_the_example_config() {
-    let config = Config::parse(EXAMPLE).expect("example config should parse");
-    assert_eq!(config.brightness, 60);
-    assert_eq!(config.pages.len(), 2);
-    assert_eq!(config.pages[0].name, "main");
-}
-
-#[test]
-fn the_example_config_is_free_of_warnings_and_hints() {
-    // Not just "no errors": the example is what users copy, so it should not
-    // model anything the validator considers a mistake.
-    let config = Config::parse(EXAMPLE).unwrap();
-    let diagnostics = config.validate(EXAMPLE);
-    assert!(
-        diagnostics.is_empty(),
-        "example config is not clean:\n{}",
-        diagnostics.render()
-    );
-}
 
 #[test]
 fn rejects_malformed_colors() {

@@ -5,10 +5,10 @@ use galdeck::Rgb;
 use galdeck_model::v1;
 use galdeck_model::{Diagnostics, Severity, StyleSource, Workspace};
 
-const EXAMPLE: &str = include_str!("../../../config/galdeck.example.toml");
+const EXAMPLE: &str = include_str!("fixtures/v1-example.toml");
 
 #[test]
-fn the_shipped_example_migrates_cleanly() {
+fn a_v1_config_migrates_cleanly() {
     let v1 = v1::Config::parse(EXAMPLE).expect("the example parses as v1");
     let workspace = Workspace::from_v1(&v1);
 
