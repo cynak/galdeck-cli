@@ -14,6 +14,7 @@ use crate::action::{Action, BuiltIn, Preset};
 use crate::animation::Animation;
 use crate::backdrop::Backdrop;
 use crate::color::ColorRef;
+use crate::icon::IconRef;
 use crate::theme::StyleLayer;
 use crate::widget::{LcdTile, Widget};
 
@@ -53,6 +54,10 @@ pub struct Global {
     /// unplugged, is passed over. Empty means every usable output.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// The icon theme a key's `icon` names are looked up in. Unset means
+    /// the desktop's own, as far as the daemon can ask for it, else Adwaita.
+    #[serde(default)]
+    pub icon_theme: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -69,6 +74,7 @@ impl Default for Global {
             encoders: Vec::new(),
             virtual_input: true,
             outputs: Vec::new(),
+            icon_theme: None,
         }
     }
 }
@@ -108,6 +114,12 @@ pub struct Profile {
     pub lcd_rows: Option<u8>,
     #[serde(default)]
     pub pages: Vec<Page>,
+    /// The keyboard's lighting, over the theme's, field by field.
+    #[serde(default)]
+    pub lighting: Option<crate::lighting::Lighting>,
+    /// How widgets look in this profile, over its theme's, field by field.
+    #[serde(default)]
+    pub widgets: Option<crate::look::WidgetLooks>,
 }
 
 impl Profile {
@@ -149,6 +161,9 @@ pub struct Page {
     pub keys: Vec<KeyConfig>,
     #[serde(default)]
     pub encoders: Vec<EncoderConfig>,
+    /// How widgets look on this page, over its profile's and its theme's.
+    #[serde(default)]
+    pub widgets: Option<crate::look::WidgetLooks>,
 }
 
 /// One key, numbered row-major from the top-left of the 3x4 grid.
@@ -158,8 +173,9 @@ pub struct KeyConfig {
     pub key: u8,
     #[serde(default)]
     pub label: Option<String>,
+    /// A picture on disk, or an icon theme's name for one.
     #[serde(default)]
-    pub icon: Option<PathBuf>,
+    pub icon: Option<IconRef>,
     /// What pressing it does: a shell command, a built-in, or a keystroke.
     #[serde(default)]
     pub exec: Option<Action>,
@@ -197,6 +213,125 @@ pub struct KeyConfig {
     /// Hands this key to a plugin, which then owns its text and colour.
     #[serde(default)]
     pub plugin: Option<PluginBinding>,
+    /// Two to eight states the key steps through, one per tap: a toggle is
+    /// two. Each can look different and run something as the key enters it.
+    #[serde(default)]
+    pub states: Vec<KeyState>,
+    /// A shell command that prints which state the key is in, so the key
+    /// follows a change made somewhere else. Without it the key shows the
+    /// state it last moved to.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// How often `status` is run while the key is showing. Defaults to
+    /// [`DEFAULT_STATUS_INTERVAL_MS`]; see [`KeyConfig::status_interval_ms`].
+    #[serde(default)]
+    pub status_interval_ms: Option<u32>,
+}
+
+/// Fewest states worth stepping through. One is nothing to switch between.
+pub const MIN_STATES: usize = 2;
+/// Most states a key may have. Taps only go forward, so reaching the one
+/// before takes all the others; past a handful, a key per choice is quicker.
+pub const MAX_STATES: usize = 8;
+/// How often a key's `status` is read, when it does not say.
+pub const DEFAULT_STATUS_INTERVAL_MS: u32 = 5000;
+/// How often at most. Every read is a process, for as long as the page shows.
+pub const MIN_STATUS_INTERVAL_MS: u32 = 2000;
+/// Longest line of `status` output compared with a state's `match`, in
+/// characters. Nothing a state is recognised by is longer.
+pub const MAX_STATUS_LINE: usize = 128;
+
+/// One of the states a key steps through.
+///
+/// ```toml
+/// [[pages.keys.states]]
+/// name = "on"
+/// match = ["enabled"]
+/// label = "Wi-Fi"
+/// icon = "network-wireless-symbolic"
+/// exec = "nmcli radio wifi on"
+/// ```
+///
+/// Its label, icon, style and animation replace the key's own while the key
+/// is in it; whatever it leaves out, the key's own supplies.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyState {
+    /// What the state is called, which is how the daemon remembers it:
+    /// unique on its key, ignoring case.
+    #[serde(default)]
+    pub name: String,
+    /// What `status` prints while the key is in this state. Defaults to the
+    /// name. Compared ignoring case and one pair of surrounding quotes, so
+    /// gsettings' `'prefer-dark'` matches `prefer-dark`.
+    #[serde(default, rename = "match")]
+    pub matches: Vec<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub icon: Option<IconRef>,
+    #[serde(default)]
+    pub style: StyleLayer,
+    #[serde(default)]
+    pub animation: Option<Animation>,
+    /// What runs as the key enters this state: what turns the thing the key
+    /// stands for on, off, or to this setting. Never run just to show the
+    /// state again -- after a restart, a reload, or a `status` read.
+    #[serde(default)]
+    pub exec: Option<Action>,
+}
+
+impl KeyState {
+    /// What `status` prints in this state: its `match`, else its name.
+    pub fn match_values(&self) -> impl Iterator<Item = &str> {
+        let own = self.matches.iter().map(String::as_str);
+        let name = self
+            .matches
+            .is_empty()
+            .then_some(self.name.as_str())
+            .into_iter();
+        own.chain(name)
+    }
+
+    /// Whether `value`, already reduced by [`status_value`], means this
+    /// state.
+    pub fn is_matched_by(&self, value: &str) -> bool {
+        let value = value.to_lowercase();
+        self.match_values()
+            .any(|candidate| match_key(candidate) == value)
+    }
+}
+
+/// A `match` value or a state's name as it is compared: without the
+/// quotes and the spaces around it, and ignoring case.
+pub(crate) fn match_key(value: &str) -> String {
+    unquote(value.trim()).to_lowercase()
+}
+
+/// What a line of `status` output is compared as: its first line with
+/// anything on it, trimmed, at most [`MAX_STATUS_LINE`] characters, with one
+/// pair of surrounding quotes taken off. `None` when it printed nothing.
+pub fn status_value(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let line: String = line.chars().take(MAX_STATUS_LINE).collect();
+    Some(unquote(&line).to_string())
+}
+
+/// One pair of quotes around the whole of `text`, `'...'` or `"..."`, taken
+/// off. Only one: a value that is itself quoted keeps its own.
+fn unquote(text: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if let Some(inner) = text
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    text
 }
 
 /// A key given over to a plugin.
@@ -240,13 +375,20 @@ impl KeyConfig {
             || self.plugin.is_some()
     }
 
-    /// What a tap does when nothing is bound to it: a key showing what is
-    /// playing plays and pauses it, a key showing the output volume mutes
-    /// it, and a timer starts and pauses. Never the microphone -- an
-    /// accidental tap must not open a live mic.
+    /// What a tap does when nothing is bound to it: a key with states moves
+    /// on to the next, a key showing what is playing plays and pauses it, a
+    /// key showing the output volume mutes it, and a timer starts and
+    /// pauses. Never the microphone -- an accidental tap must not open a
+    /// live mic.
     pub fn implicit_tap(&self) -> Option<Action> {
         if self.tap_is_taken() {
             return None;
+        }
+        // Ahead of the widget, which a key with states is not meant to have
+        // either: which of the two a tap does must not depend on which
+        // mistake was made.
+        if !self.states.is_empty() {
+            return Some(Action::built_in(BuiltIn::NextState));
         }
         let widget = self.widget.as_ref()?;
         let invocation = |action| {
@@ -273,7 +415,7 @@ impl KeyConfig {
     /// Only where the tap is the widget's too, so a key whose tap was given
     /// something else does not find its hold taken as well.
     pub fn implicit_hold(&self) -> Option<Action> {
-        if self.hold.is_some() || self.tap_is_taken() {
+        if self.hold.is_some() || self.tap_is_taken() || !self.states.is_empty() {
             return None;
         }
         self.widget
@@ -293,12 +435,70 @@ impl KeyConfig {
     }
 
     /// Every action on the key, for checks that apply to all of them: its
-    /// gestures, and what its widget does when a timer finishes.
+    /// gestures, what its widget does when a timer finishes, and what each
+    /// of its states runs as the key enters it.
     pub fn actions(&self) -> impl Iterator<Item = &Action> {
         [&self.exec, &self.hold, &self.double]
             .into_iter()
             .flatten()
             .chain(self.widget.as_ref().and_then(|w| w.on_done.as_ref()))
+            .chain(self.states.iter().filter_map(|state| state.exec.as_ref()))
+    }
+
+    /// The state called `name`. Names are unique ignoring case, so a name
+    /// written with other capitals still finds its state.
+    pub fn state(&self, name: &str) -> Option<&KeyState> {
+        self.states
+            .iter()
+            .find(|state| state.name == name)
+            .or_else(|| {
+                let name = name.to_lowercase();
+                self.states
+                    .iter()
+                    .find(|state| state.name.to_lowercase() == name)
+            })
+    }
+
+    /// The state `status` output says the key is in: the first whose
+    /// `match` it is. `None` for output that is empty or matches nothing.
+    pub fn state_matching(&self, output: &str) -> Option<&KeyState> {
+        let value = status_value(output)?;
+        self.states.iter().find(|state| state.is_matched_by(&value))
+    }
+
+    /// How often `status` is read: as written, else the default, and never
+    /// more often than [`MIN_STATUS_INTERVAL_MS`].
+    pub fn status_interval_ms(&self) -> u32 {
+        self.status_interval_ms
+            .unwrap_or(DEFAULT_STATUS_INTERVAL_MS)
+            .max(MIN_STATUS_INTERVAL_MS)
+    }
+
+    /// The key as it looks in the state called `name`: the state's label,
+    /// icon and animation in place of the key's own, and its style over the
+    /// key's, field by field. Whatever the state leaves out, the key's own
+    /// supplies; a name that is no state is the key's own look.
+    ///
+    /// For drawing. The result has no states and no `status`, so it is a
+    /// look rather than a binding: what its tap does is the key's to say.
+    pub fn in_state(&self, name: &str) -> KeyConfig {
+        let mut look = self.clone();
+        look.states = Vec::new();
+        look.status = None;
+        look.status_interval_ms = None;
+        if let Some(state) = self.state(name) {
+            if state.label.is_some() {
+                look.label.clone_from(&state.label);
+            }
+            if state.icon.is_some() {
+                look.icon.clone_from(&state.icon);
+            }
+            look.style = self.style.over(&state.style);
+            if state.animation.is_some() {
+                look.animation.clone_from(&state.animation);
+            }
+        }
+        look
     }
 }
 

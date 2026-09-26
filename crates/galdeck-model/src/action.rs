@@ -67,6 +67,10 @@ pub enum BuiltIn {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Moves the key it is bound to on to its next state. Keys only.
+    NextState,
+    /// Moves the key it is bound to back to its previous state. Keys only.
+    PreviousState,
 }
 
 /// What a step counts, for a built-in that takes one.
@@ -80,17 +84,27 @@ pub enum StepUnit {
 /// Which gestures a built-in can be bound to.
 ///
 /// Most work anywhere. The rest act on the thing they are bound to -- the
-/// key's own timer, the knob's own modes -- or need to see the key come back
-/// up, and bound anywhere else they would have nothing to act on.
+/// key's own timer or states, the knob's own modes -- or need to see the key
+/// come back up, and bound anywhere else they would have nothing to act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotRule {
     Anywhere,
     /// Only what tapping a key does: push-to-talk.
     KeyTapOnly,
-    /// Only a key's gestures: the timer built-ins.
+    /// Only a key's gestures: the timer and state built-ins.
     KeyOnly,
     /// Only a knob's gestures: `next_mode` and `next_app`.
     KnobOnly,
+}
+
+/// The part of its own key a key-only built-in acts on, which that key
+/// has to have for it to do anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyPart {
+    /// A `timer` or `stopwatch` widget.
+    Timer,
+    /// `states` to step through.
+    States,
 }
 
 /// What a built-in's `target` names.
@@ -215,6 +229,8 @@ impl BuiltIn {
         BuiltIn::ZoomIn,
         BuiltIn::ZoomOut,
         BuiltIn::ZoomReset,
+        BuiltIn::NextState,
+        BuiltIn::PreviousState,
     ];
 
     /// Where it is in [`BuiltIn::ALL`].
@@ -260,6 +276,8 @@ impl BuiltIn {
             BuiltIn::ZoomIn => 34,
             BuiltIn::ZoomOut => 35,
             BuiltIn::ZoomReset => 36,
+            BuiltIn::NextState => 37,
+            BuiltIn::PreviousState => 38,
         }
     }
 
@@ -303,6 +321,8 @@ impl BuiltIn {
             BuiltIn::ZoomIn => "zoom_in",
             BuiltIn::ZoomOut => "zoom_out",
             BuiltIn::ZoomReset => "zoom_reset",
+            BuiltIn::NextState => "next_state",
+            BuiltIn::PreviousState => "previous_state",
         }
     }
 
@@ -346,6 +366,8 @@ impl BuiltIn {
             BuiltIn::ZoomIn => "zoom in",
             BuiltIn::ZoomOut => "zoom out",
             BuiltIn::ZoomReset => "reset zoom",
+            BuiltIn::NextState => "the key's next state",
+            BuiltIn::PreviousState => "the key's previous state",
         }
     }
 
@@ -379,6 +401,7 @@ impl BuiltIn {
             | BuiltIn::StartProfile => "Deck",
             BuiltIn::DeckBrighter | BuiltIn::DeckDimmer | BuiltIn::NextMode => "Deck",
             BuiltIn::TimerToggle | BuiltIn::TimerReset => "Timer",
+            BuiltIn::NextState | BuiltIn::PreviousState => "Toggle",
             BuiltIn::ScrollUp
             | BuiltIn::ScrollDown
             | BuiltIn::ScrollLeft
@@ -435,11 +458,24 @@ impl BuiltIn {
         match self {
             // It has to see the key come back up.
             BuiltIn::PushToTalk => SlotRule::KeyTapOnly,
-            // They act on the key's own timer.
-            BuiltIn::TimerToggle | BuiltIn::TimerReset => SlotRule::KeyOnly,
+            // They act on the key's own timer, or its own states.
+            BuiltIn::TimerToggle
+            | BuiltIn::TimerReset
+            | BuiltIn::NextState
+            | BuiltIn::PreviousState => SlotRule::KeyOnly,
             // They act on the knob's own modes, or on the app it remembers.
             BuiltIn::NextMode | BuiltIn::NextApp => SlotRule::KnobOnly,
             _ => SlotRule::Anywhere,
+        }
+    }
+
+    /// The part of its own key it acts on, for the built-ins that act on the
+    /// key they are bound to.
+    pub fn acts_on(self) -> Option<KeyPart> {
+        match self {
+            BuiltIn::TimerToggle | BuiltIn::TimerReset => Some(KeyPart::Timer),
+            BuiltIn::NextState | BuiltIn::PreviousState => Some(KeyPart::States),
+            _ => None,
         }
     }
 
@@ -1120,11 +1156,28 @@ mod tests {
         assert_eq!(BuiltIn::PushToTalk.slot_rule(), SlotRule::KeyTapOnly);
         assert_eq!(BuiltIn::TimerToggle.slot_rule(), SlotRule::KeyOnly);
         assert_eq!(BuiltIn::TimerReset.slot_rule(), SlotRule::KeyOnly);
+        assert_eq!(BuiltIn::NextState.slot_rule(), SlotRule::KeyOnly);
+        assert_eq!(BuiltIn::PreviousState.slot_rule(), SlotRule::KeyOnly);
         assert_eq!(BuiltIn::NextMode.slot_rule(), SlotRule::KnobOnly);
         assert_eq!(BuiltIn::NextApp.slot_rule(), SlotRule::KnobOnly);
         assert_eq!(BuiltIn::NextOutput.slot_rule(), SlotRule::Anywhere);
         assert_eq!(BuiltIn::SetOutput.target_kind(), Some(TargetKind::Sink));
         assert_eq!(BuiltIn::AppMute.target_kind(), Some(TargetKind::App));
         assert!(!BuiltIn::MicMute.takes_target());
+    }
+
+    #[test]
+    fn every_built_in_that_acts_on_its_own_key_says_which_part() {
+        for built_in in BuiltIn::ALL {
+            let key_only = built_in.slot_rule() == SlotRule::KeyOnly;
+            assert_eq!(
+                built_in.acts_on().is_some(),
+                key_only,
+                "{built_in:?}: a key-only built-in acts on something its key has"
+            );
+        }
+        assert_eq!(BuiltIn::TimerToggle.acts_on(), Some(KeyPart::Timer));
+        assert_eq!(BuiltIn::PreviousState.acts_on(), Some(KeyPart::States));
+        assert_eq!(BuiltIn::PushToTalk.acts_on(), None);
     }
 }

@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 use crate::action::Action;
 use crate::color::ColorRef;
+use crate::look::{BarStyle, GraphStyle, WidgetLook};
 
 /// Fastest a widget may refresh.
 ///
@@ -221,10 +222,13 @@ pub enum WidgetView {
     Gauge,
     /// For `clock`: a clock face with hands.
     Analog,
-    /// For `clock`: a glowing nixie tube for each digit of `format` --
-    /// six, hours to seconds, unless it says otherwise -- with dust drifting
-    /// past and the odd tube flickering. Drawn in warm neon unless `color`
-    /// says otherwise, on a dark panel unless `background` does.
+    /// A glowing nixie tube for each digit: of `format` for a `clock` --
+    /// six, hours to seconds, unless it says otherwise -- and of the reading
+    /// for anything that measures, or for a timer or stopwatch. A unit goes
+    /// on a symbol tube, as on real IN-19s: `%`, `°C`, `°F`, `K`, `M`, `G`,
+    /// and a sign. The title glows as neon too. Dust drifts past and the odd
+    /// tube flickers. Drawn in warm neon unless `color` says otherwise, on a
+    /// dark panel unless `background` does.
     Nixie,
 }
 
@@ -245,9 +249,12 @@ impl WidgetView {
         match (self, kind) {
             (WidgetView::Text, _) => true,
             (WidgetView::Bar | WidgetView::Gauge, WidgetKind::Timer) => true,
+            // Tubes count down, and up, as well as they tell the time.
+            (WidgetView::Nixie, WidgetKind::Timer | WidgetKind::Stopwatch) => true,
             (_, WidgetKind::Timer | WidgetKind::Stopwatch) => false,
             (WidgetView::Graph | WidgetView::Bar | WidgetView::Gauge, _) => kind.is_numeric(),
-            (WidgetView::Analog | WidgetView::Nixie, _) => kind == WidgetKind::Clock,
+            (WidgetView::Analog, _) => kind == WidgetKind::Clock,
+            (WidgetView::Nixie, _) => kind == WidgetKind::Clock || kind.is_numeric(),
         }
     }
 }
@@ -354,6 +361,24 @@ pub struct Widget {
     /// A picture behind the widget, scaled to cover it.
     #[serde(default)]
     pub image: Option<std::path::PathBuf>,
+    /// For a graph: `area` (the default), `line`, or `bars`.
+    #[serde(default)]
+    pub graph: Option<GraphStyle>,
+    /// For a bar: `rounded` (the default), `flat`, or `segmented`.
+    #[serde(default)]
+    pub bar: Option<BarStyle>,
+    /// For a segmented bar: how many steps it lights, 2 to 40.
+    #[serde(default)]
+    pub segments: Option<u8>,
+    /// For a gauge: how far round its dial goes, in degrees, 90 to 360.
+    #[serde(default)]
+    pub sweep: Option<u16>,
+    /// For a gauge: how thick its arc is, as a share of the dial's radius.
+    #[serde(default)]
+    pub thickness: Option<f32>,
+    /// On the screen: how round the corners of its card are, in pixels.
+    #[serde(default)]
+    pub radius: Option<u32>,
     /// Text shown before the widget has produced anything, and whenever it
     /// fails. Falls back to the key's label.
     #[serde(default)]
@@ -366,6 +391,14 @@ pub struct Widget {
     /// For `timer`: what to do, once, when it finishes -- play a sound, say.
     #[serde(default)]
     pub on_done: Option<Action>,
+    /// What its page, profile and theme say about widgets like it, under
+    /// whatever it says itself; the accessors below read the two together.
+    ///
+    /// Filled in by [`crate::Workspace`] when the configuration loads, and
+    /// never read from a file or written to one: saving a widget writes only
+    /// what the widget itself says, so it keeps following its theme.
+    #[serde(skip)]
+    pub look: WidgetLook,
 }
 
 /// The units a `duration` may use, in the order they must come, and how many
@@ -448,10 +481,86 @@ impl Widget {
             background: None,
             opacity: None,
             image: None,
+            graph: None,
+            bar: None,
+            segments: None,
+            sweep: None,
+            thickness: None,
+            radius: None,
             placeholder: None,
             duration: None,
             on_done: None,
+            look: WidgetLook::default(),
         }
+    }
+
+    /// What the widget says about its own look, as a layer over its
+    /// [`Widget::look`] -- for checking its values the way a theme's are.
+    pub fn own_look(&self) -> WidgetLook {
+        WidgetLook {
+            view: self.view,
+            color: self.color.clone(),
+            background: self.background.clone(),
+            opacity: self.opacity,
+            graph: self.graph,
+            bar: self.bar,
+            segments: self.segments,
+            sweep: self.sweep,
+            thickness: self.thickness,
+            radius: self.radius,
+        }
+    }
+
+    /// The colour its graph, bar or dial is drawn in: its own, else its
+    /// look's, else none and the text colour is used.
+    pub fn color(&self) -> Option<&ColorRef> {
+        self.color.as_ref().or(self.look.color.as_ref())
+    }
+
+    /// What it sits on: its own, else its look's.
+    pub fn background(&self) -> Option<&ColorRef> {
+        self.background.as_ref().or(self.look.background.as_ref())
+    }
+
+    pub fn graph_style(&self) -> GraphStyle {
+        self.graph.or(self.look.graph).unwrap_or_default()
+    }
+
+    pub fn bar_style(&self) -> BarStyle {
+        self.bar.or(self.look.bar).unwrap_or_default()
+    }
+
+    /// Steps in a segmented bar.
+    pub fn segments(&self) -> u8 {
+        self.segments
+            .or(self.look.segments)
+            .unwrap_or(crate::look::DEFAULT_SEGMENTS)
+            .clamp(crate::look::MIN_SEGMENTS, crate::look::MAX_SEGMENTS)
+    }
+
+    /// How far round a gauge's dial goes, in degrees.
+    pub fn sweep(&self) -> f32 {
+        let sweep = self
+            .sweep
+            .or(self.look.sweep)
+            .unwrap_or(crate::look::DEFAULT_SWEEP)
+            .clamp(crate::look::MIN_SWEEP, crate::look::MAX_SWEEP);
+        f32::from(sweep)
+    }
+
+    /// How thick a gauge's arc is, as a share of its radius.
+    pub fn thickness(&self) -> f32 {
+        self.thickness
+            .or(self.look.thickness)
+            .unwrap_or(crate::look::DEFAULT_THICKNESS)
+            .clamp(crate::look::MIN_THICKNESS, crate::look::MAX_THICKNESS)
+    }
+
+    /// How round its card on the screen is, if it or its look says.
+    pub fn radius(&self) -> Option<u32> {
+        self.radius
+            .or(self.look.radius)
+            .map(|radius| radius.min(crate::look::MAX_RADIUS))
     }
 
     /// How long a timer counts down, if `duration` says, in a form
@@ -461,12 +570,12 @@ impl Widget {
     }
 
     pub fn interval_ms(&self) -> u32 {
-        let floor = if self.kind == WidgetKind::Weather {
-            MIN_NETWORK_INTERVAL_MS
-        } else {
-            MIN_INTERVAL_MS
-        };
-        // An animated view refreshes at its frame rate, not its data's.
+        // An animated view refreshes at its frame rate, not its data's. A
+        // clock's own interval may slow its frames down; anything else's
+        // paces its readings instead -- see `sample_interval_ms`.
+        if self.view().is_animated() && self.kind != WidgetKind::Clock {
+            return MIN_INTERVAL_MS;
+        }
         let default = if self.view().is_animated() {
             MIN_INTERVAL_MS
         } else {
@@ -474,7 +583,30 @@ impl Widget {
         };
         self.interval_ms
             .unwrap_or(default)
-            .clamp(floor, MAX_INTERVAL_MS)
+            .clamp(self.interval_floor(), MAX_INTERVAL_MS)
+    }
+
+    /// How often the widget's data is read. The same as `interval_ms` but
+    /// for an animated view of anything except a clock: that is redrawn at
+    /// its frame rate while its data is read at the kind's own pace. Tubes
+    /// glowing over a CPU reading must not read the CPU ten times a second,
+    /// let alone run a command.
+    pub fn sample_interval_ms(&self) -> u32 {
+        if !self.view().is_animated() || self.kind == WidgetKind::Clock {
+            return self.interval_ms();
+        }
+        self.interval_ms
+            .unwrap_or(self.kind.default_interval_ms())
+            .clamp(self.interval_floor(), MAX_INTERVAL_MS)
+    }
+
+    /// The shortest interval a widget may ask for.
+    fn interval_floor(&self) -> u32 {
+        if self.kind == WidgetKind::Weather {
+            MIN_NETWORK_INTERVAL_MS
+        } else {
+            MIN_INTERVAL_MS
+        }
     }
 
     /// The format string to use, with a default per kind.
@@ -487,8 +619,12 @@ impl Widget {
         })
     }
 
+    /// How it is drawn: its own view, else its look's if it can be drawn
+    /// that way, else text.
     pub fn view(&self) -> WidgetView {
-        self.view.unwrap_or_default()
+        self.view
+            .or(self.look.view.filter(|view| view.suits(self.kind)))
+            .unwrap_or_default()
     }
 
     pub fn units(&self) -> Units {
@@ -528,9 +664,13 @@ impl Widget {
         }
     }
 
-    /// The background's opacity, 0 to 1. Opaque unless said otherwise.
+    /// The background's opacity, 0 to 1. Opaque unless it or its look says
+    /// otherwise.
     pub fn opacity(&self) -> f32 {
-        self.opacity.unwrap_or(1.0).clamp(0.0, 1.0)
+        self.opacity
+            .or(self.look.opacity)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0)
     }
 
     /// The zone to tell the time in, if not the machine's own.

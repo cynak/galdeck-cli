@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::action::KeyPart;
 use crate::color::{resolve_palette, ColorRef, Palette, ResolvedPalette};
 use crate::diag::{Diagnostic, Diagnostics, LineIndex};
 use crate::theme::{
@@ -15,7 +16,7 @@ use crate::theme::{
 use crate::v1;
 use crate::v2::{
     EncoderConfig, Global, KeyConfig, ModeEntry, Page, Profile, Workspace, CURRENT_VERSION,
-    MAX_MODES,
+    MAX_MODES, MAX_STATES, MIN_STATES, MIN_STATUS_INTERVAL_MS,
 };
 
 /// Where a config directory lives: `$XDG_CONFIG_HOME/galdeck`.
@@ -59,7 +60,8 @@ impl Workspace {
             return match std::fs::read_to_string(&legacy) {
                 Ok(text) => match v1::Config::parse(&text) {
                     Ok(config) => {
-                        let workspace = Workspace::from_v1(&config);
+                        let mut workspace = Workspace::from_v1(&config);
+                        workspace.dress_widgets();
                         out.push(Diagnostic::hint(
                             "H0100",
                             "config.toml",
@@ -112,11 +114,12 @@ impl Workspace {
         let profiles = read_dir_of("profiles", dir, overrides, &mut out);
         let themes = read_dir_of("themes", dir, overrides, &mut out);
 
-        let workspace = Workspace {
+        let mut workspace = Workspace {
             global,
             profiles,
             themes,
         };
+        workspace.dress_widgets();
         let mut all = workspace.validate();
         for d in out.sorted() {
             all.push(d);
@@ -147,7 +150,9 @@ impl Workspace {
                     .map(|key| KeyConfig {
                         key: key.key,
                         label: key.label.clone(),
-                        icon: key.image.clone(),
+                        // A version 1 `image` was always a file, whatever
+                        // it looks like.
+                        icon: key.image.clone().map(crate::icon::IconRef::from),
                         exec: key.exec.clone().map(crate::action::Action::Shell),
                         hold: None,
                         double: None,
@@ -157,6 +162,9 @@ impl Workspace {
                         animation: None,
                         widget: None,
                         plugin: None,
+                        states: Vec::new(),
+                        status: None,
+                        status_interval_ms: None,
                         style: StyleLayer {
                             // v1's `color` was the key background.
                             key_bg: key.color.as_deref().and_then(literal),
@@ -184,6 +192,7 @@ impl Workspace {
                         animation: None,
                     })
                     .collect(),
+                widgets: None,
             })
             .collect();
 
@@ -197,6 +206,8 @@ impl Workspace {
             lcd_columns: None,
             lcd_rows: None,
             pages,
+            lighting: None,
+            widgets: None,
         };
 
         Workspace {
@@ -275,6 +286,153 @@ impl Workspace {
         }
 
         (style, resolve_palette(&palette, out))
+    }
+
+    /// The keyboard lighting a profile asks for: its theme's `[lighting]`
+    /// with the `extends` chain folded in, then the profile's own over it.
+    /// `None` when neither says anything, which leaves the keyboard alone.
+    pub fn lighting_for(
+        &self,
+        profile: &Profile,
+        out: &mut Diagnostics,
+    ) -> Option<crate::lighting::ResolvedLighting> {
+        // Nearest theme first. Bounded like `theme_for`, which is what
+        // reports a broken chain; this only has to stop.
+        let mut layers = Vec::new();
+        let mut id = profile.theme.as_deref();
+        for _ in 0..MAX_EXTENDS_DEPTH {
+            let Some(theme) = id.and_then(|id| self.themes.get(id)) else {
+                break;
+            };
+            layers.extend(theme.lighting.as_ref());
+            id = theme.extends.as_deref();
+        }
+        if layers.is_empty() && profile.lighting.is_none() {
+            return None;
+        }
+
+        let mut lighting = crate::lighting::Lighting::default();
+        for layer in layers.iter().rev() {
+            lighting.overlay(layer);
+        }
+        if let Some(own) = &profile.lighting {
+            lighting.overlay(own);
+        }
+        // The theme's own problems are reported by `theme_for` wherever the
+        // theme is used; only the lighting's are new here.
+        let (_, palette) = self.theme_for(profile.theme.as_deref(), &mut Diagnostics::new());
+        Some(lighting.resolve(&palette, "lighting", out))
+    }
+
+    /// A theme and the themes it extends, nearest first: `mine`, then the
+    /// theme `mine` extends, and so on up.
+    ///
+    /// Stops where [`Workspace::theme_for`] stops -- at an unknown theme, a
+    /// repeat, or [`MAX_EXTENDS_DEPTH`] themes -- and leaves reporting that to
+    /// it. Empty for an unknown `id`.
+    pub fn theme_chain(&self, id: &str) -> Vec<(&str, &crate::theme::Theme)> {
+        let mut chain: Vec<(&str, &crate::theme::Theme)> = Vec::new();
+        let mut next = self.themes.get_key_value(id);
+        while let Some((id, theme)) = next {
+            if chain.len() >= MAX_EXTENDS_DEPTH || chain.iter().any(|(seen, _)| *seen == id) {
+                break;
+            }
+            chain.push((id, theme));
+            next = theme
+                .extends
+                .as_deref()
+                .and_then(|parent| self.themes.get_key_value(parent));
+        }
+        chain
+    }
+
+    /// What a theme and the themes it extends say about a widget of `kind`,
+    /// the nearest winning field by field -- the theme on its own, as its
+    /// editor previews it.
+    pub fn theme_widget_look(
+        &self,
+        theme: &str,
+        kind: crate::widget::WidgetKind,
+    ) -> crate::look::WidgetLook {
+        look_through(
+            self.theme_chain(theme)
+                .into_iter()
+                .filter_map(|(_, theme)| theme.widgets.as_ref()),
+            kind,
+        )
+    }
+
+    /// What a widget of `kind` on `page` of `profile` takes from them, under
+    /// whatever it says itself: the page's `[widgets]`, then the profile's,
+    /// then its theme's.
+    pub fn widget_look(
+        &self,
+        profile: &Profile,
+        page: Option<&Page>,
+        kind: crate::widget::WidgetKind,
+    ) -> crate::look::WidgetLook {
+        let theme = profile
+            .theme
+            .as_deref()
+            .map(|id| self.theme_chain(id))
+            .unwrap_or_default();
+        look_through(
+            page.and_then(|page| page.widgets.as_ref())
+                .into_iter()
+                .chain(profile.widgets.as_ref())
+                .chain(
+                    theme
+                        .into_iter()
+                        .filter_map(|(_, theme)| theme.widgets.as_ref()),
+                ),
+            kind,
+        )
+    }
+
+    /// Give every widget its look; see [`crate::widget::Widget::look`].
+    ///
+    /// Once, when the configuration loads, so that drawing a widget never
+    /// has to go looking through themes -- and a widget keeps its look for
+    /// as long as the configuration it came from.
+    pub fn dress_widgets(&mut self) {
+        // Worked out in full first: the looks read the themes and profiles
+        // that the second pass is about to borrow mutably.
+        let mut looks = Vec::new();
+        for (id, profile) in &self.profiles {
+            for (index, page) in profile.pages.iter().enumerate() {
+                let key_looks: Vec<_> = page
+                    .keys
+                    .iter()
+                    .map(|key| {
+                        let widget = key.widget.as_ref()?;
+                        Some(self.widget_look(profile, Some(page), widget.kind))
+                    })
+                    .collect();
+                let tile_looks: Vec<_> = page
+                    .lcd
+                    .iter()
+                    .map(|tile| self.widget_look(profile, Some(page), tile.widget.kind))
+                    .collect();
+                looks.push((id.clone(), index, key_looks, tile_looks));
+            }
+        }
+        for (id, index, key_looks, tile_looks) in looks {
+            let Some(page) = self
+                .profiles
+                .get_mut(&id)
+                .and_then(|profile| profile.pages.get_mut(index))
+            else {
+                continue;
+            };
+            for (key, look) in page.keys.iter_mut().zip(key_looks) {
+                if let (Some(widget), Some(look)) = (key.widget.as_mut(), look) {
+                    widget.look = look;
+                }
+            }
+            for (tile, look) in page.lcd.iter_mut().zip(tile_looks) {
+                tile.widget.look = look;
+            }
+        }
     }
 
     /// A knob on a page in its first mode; see [`Workspace::encoder_for_mode`].
@@ -490,6 +648,25 @@ impl Workspace {
                 );
             }
         }
+        if let Some(theme) = self.global.icon_theme.as_deref() {
+            // The daemon looks for a directory by this name, so anything
+            // that would take it somewhere else is refused there.
+            let one_directory = !theme.is_empty()
+                && theme != "."
+                && theme != ".."
+                && !theme.contains('/')
+                && !theme.chars().any(char::is_control);
+            if !one_directory {
+                out.push(
+                    Diagnostic::warning(
+                        "W0196",
+                        "icon_theme",
+                        format!("{theme:?} is not the name of an icon theme, so it is not used"),
+                    )
+                    .with_help("the name of a folder in /usr/share/icons or ~/.local/share/icons, such as \"Adwaita\""),
+                );
+            }
+        }
 
         for (id, profile) in &self.profiles {
             let at = |what: &str| format!("profiles.{id}.{what}");
@@ -542,12 +719,21 @@ impl Workspace {
             let mut seen_pages: Vec<&str> = Vec::new();
             for (p, page) in profile.pages.iter().enumerate() {
                 let at = |what: &str| format!("profiles.{id}.pages[{p}].{what}");
+                // Still reached by `next_page`, which goes by place in the
+                // list. But a switch by id, and what the daemon keeps of a
+                // key's states and timer, find the first page with the id.
                 if seen_pages.contains(&page.id.as_str()) {
-                    out.push(Diagnostic::warning(
-                        "W0103",
-                        at("id"),
-                        format!("duplicate page {:?}; only the first is reachable", page.id),
-                    ));
+                    out.push(
+                        Diagnostic::warning(
+                            "W0103",
+                            at("id"),
+                            format!(
+                                "duplicate page {:?}; switching to it goes to the first, and this one's keys have no states or timers",
+                                page.id
+                            ),
+                        )
+                        .with_help("rename one of them"),
+                    );
                 }
                 seen_pages.push(&page.id);
                 if let Some(background) = &page.background {
@@ -645,6 +831,10 @@ impl Workspace {
                             &mut out,
                         );
                     }
+                    if let Some(icon) = &key.icon {
+                        icon.check(&at("icon"), &mut out);
+                    }
+                    check_states(key, &at, self.global.virtual_input, &mut out);
                     let counts = key.widget.as_ref().is_some_and(|w| w.kind.is_timer());
                     for (name, action) in [
                         ("exec", &key.exec),
@@ -664,21 +854,35 @@ impl Workspace {
                                 self.global.virtual_input,
                                 &mut out,
                             );
-                            let timed = action.as_built_in().filter(|i| {
-                                i.action.slot_rule() == crate::action::SlotRule::KeyOnly
-                            });
-                            if let Some(timed) = timed.filter(|_| !counts) {
-                                out.push(
+                            let own = action
+                                .as_built_in()
+                                .and_then(|i| Some((i.action, i.action.acts_on()?)));
+                            match own {
+                                Some((built_in, KeyPart::Timer)) if !counts => out.push(
                                     Diagnostic::warning(
                                         "W0183",
                                         at(name),
                                         format!(
                                             "{} acts on the key's own timer, and this key has none",
-                                            timed.action.name()
+                                            built_in.name()
                                         ),
                                     )
                                     .with_help("give the key a `timer` or `stopwatch` widget"),
-                                );
+                                ),
+                                Some((built_in, KeyPart::States)) if key.states.is_empty() => {
+                                    out.push(
+                                        Diagnostic::warning(
+                                            "W0192",
+                                            at(name),
+                                            format!(
+                                                "{} steps through the states of the key it is bound to, and this key has none",
+                                                built_in.name()
+                                            ),
+                                        )
+                                        .with_help("give the key `states` to step through"),
+                                    )
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -912,6 +1116,17 @@ impl Workspace {
                         &path,
                         &mut out,
                     );
+                    // Only the state's own layer: the key's beneath it was
+                    // resolved just above, and would be reported twice.
+                    for (s, state) in key.states.iter().enumerate() {
+                        let path = format!("profiles.{id}.pages[{p}].keys[{k}].states[{s}].style");
+                        let _ = resolve(
+                            &[(StyleSource::Cell, &state.style)],
+                            &palette,
+                            &path,
+                            &mut out,
+                        );
+                    }
                 }
                 for (e, encoder) in page.encoders.iter().enumerate() {
                     let path = format!("profiles.{id}.pages[{p}].encoders[{e}].style");
@@ -928,8 +1143,76 @@ impl Workspace {
             }
         }
 
+        // Lighting is checked layer by layer, against the palette each layer
+        // is used with, so a problem is reported where it is written.
+        let lit_themes = self.themes.iter().filter_map(|(id, theme)| {
+            let lighting = theme.lighting.as_ref()?;
+            Some((format!("themes.{id}.lighting"), lighting, Some(id.as_str())))
+        });
+        let lit_profiles = self.profiles.iter().filter_map(|(id, profile)| {
+            let lighting = profile.lighting.as_ref()?;
+            Some((
+                format!("profiles.{id}.lighting"),
+                lighting,
+                profile.theme.as_deref(),
+            ))
+        });
+        for (path, lighting, theme) in lit_themes.chain(lit_profiles) {
+            lighting.check(&path, &mut out);
+            let (_, palette) = self.theme_for(theme, &mut Diagnostics::new());
+            let _ = lighting.resolve(&palette, &path, &mut out);
+        }
+
+        // Widget looks likewise: each `[widgets]` checked where it is
+        // written, and its colours against the palette it is used with.
+        let themed_looks = self.themes.iter().filter_map(|(id, theme)| {
+            let looks = theme.widgets.as_ref()?;
+            Some((format!("themes.{id}.widgets"), looks, Some(id.as_str())))
+        });
+        let own_looks = self.profiles.iter().flat_map(|(id, profile)| {
+            let theme = profile.theme.as_deref();
+            let pages = profile
+                .pages
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, page)| {
+                    let looks = page.widgets.as_ref()?;
+                    Some((
+                        format!("profiles.{id}.pages[{index}].widgets"),
+                        looks,
+                        theme,
+                    ))
+                });
+            profile
+                .widgets
+                .iter()
+                .map(move |looks| (format!("profiles.{id}.widgets"), looks, theme))
+                .chain(pages)
+        });
+        for (path, looks, theme) in themed_looks.chain(own_looks) {
+            looks.check(&path, &mut out);
+            let (_, palette) = self.theme_for(theme, &mut Diagnostics::new());
+            for (at, _, look) in looks.layers(&path) {
+                for (field, color) in look.colors() {
+                    let _ = palette.resolve(color, &format!("{at}.{field}"), &mut out);
+                }
+            }
+        }
+
         out
     }
+}
+
+/// Fold `[widgets]` layers, nearest first, into what they say about a
+/// widget of `kind`: in each layer its kind's look over its every-widget
+/// look, and a nearer layer over a farther one.
+fn look_through<'a>(
+    layers: impl Iterator<Item = &'a crate::look::WidgetLooks>,
+    kind: crate::widget::WidgetKind,
+) -> crate::look::WidgetLook {
+    layers.fold(crate::look::WidgetLook::default(), |look, layer| {
+        look.or(&layer.for_kind(kind))
+    })
 }
 
 /// A period outside what the panel can show is clamped rather than refused,
@@ -950,6 +1233,178 @@ fn check_period(animation: &crate::animation::Animation, path: &str, out: &mut D
             )
             .with_help("below the minimum it reads as a flicker rather than motion"),
         );
+    }
+}
+
+/// A key's states, what sits beside them, and each one's own settings.
+fn check_states(
+    key: &KeyConfig,
+    at: &dyn Fn(&str) -> String,
+    virtual_input: bool,
+    out: &mut Diagnostics,
+) {
+    let count = key.states.len();
+    if count == 0 && key.status.is_some() {
+        out.push(
+            Diagnostic::warning(
+                "W0195",
+                at("status"),
+                "`status` reads which state the key is in, and this key has no states",
+            )
+            .with_help("give the key `states`, or remove `status`"),
+        );
+    }
+    if count > 0 && !(MIN_STATES..=MAX_STATES).contains(&count) {
+        out.push(
+            Diagnostic::error(
+                "E0186",
+                at("states"),
+                format!(
+                    "a key steps through {MIN_STATES} to {MAX_STATES} states; this one has {count}"
+                ),
+            )
+            .with_help(if count < MIN_STATES {
+                "one state is nothing to switch between: add another, or give the key its look directly"
+            } else {
+                "taps only go forward, so past a handful a key for each choice is quicker"
+            }),
+        );
+    }
+    if count > 0 {
+        // A key with states steps through them when tapped; anything else
+        // bound to the tap would take it over, and the states would never
+        // change.
+        for (field, set) in [
+            ("exec", key.exec.is_some()),
+            ("page", key.page.is_some()),
+            ("profile", key.profile.is_some()),
+            ("back", key.back),
+            ("plugin", key.plugin.is_some()),
+        ] {
+            if set {
+                out.push(
+                    Diagnostic::error(
+                        "E0188",
+                        at(field),
+                        format!("`{field}` and `states` both say what tapping this key does"),
+                    )
+                    .with_help("a key with states steps through them when tapped; move this to `hold`, `double` or another key"),
+                );
+            }
+        }
+        if key.widget.is_some() {
+            out.push(
+                Diagnostic::error(
+                    "E0188",
+                    at("widget"),
+                    "a key with states shows which one it is in, so it cannot show a widget too",
+                )
+                .with_help("give the widget a key of its own"),
+            );
+        }
+    }
+    if let Some(interval) = key.status_interval_ms {
+        if key.status.is_none() {
+            out.push(Diagnostic::warning(
+                "W0190",
+                at("status_interval_ms"),
+                "`status_interval_ms` is how often `status` is read, and this key has no `status`",
+            ));
+        } else if interval < MIN_STATUS_INTERVAL_MS {
+            out.push(
+                Diagnostic::warning(
+                    "W0190",
+                    at("status_interval_ms"),
+                    format!(
+                        "every {interval} ms is more often than every {MIN_STATUS_INTERVAL_MS} ms, and will be clamped to it"
+                    ),
+                )
+                .with_help("every read starts a process, for as long as the page is showing"),
+            );
+        }
+    }
+    if key.status.as_deref().is_some_and(|c| c.trim().is_empty()) {
+        out.push(Diagnostic::warning(
+            "W0122",
+            at("status"),
+            "an empty command does nothing",
+        ));
+    }
+
+    for (s, state) in key.states.iter().enumerate() {
+        let at = |what: &str| at(&format!("states[{s}].{what}"));
+        let same_name = |other: &crate::v2::KeyState| {
+            other.name.trim().to_lowercase() == state.name.trim().to_lowercase()
+        };
+        if state.name.trim().is_empty() {
+            out.push(
+                Diagnostic::error("E0187", at("name"), "a state needs a name")
+                    .with_help("the name is how the key remembers which state it is in"),
+            );
+        } else if let Some(first) = key.states[..s].iter().position(same_name) {
+            out.push(
+                Diagnostic::error(
+                    "E0187",
+                    at("name"),
+                    format!("states[{first}] is called {:?} too", key.states[first].name),
+                )
+                .with_help(
+                    "names differ by more than capitals, so the key can tell which state it is in",
+                ),
+            );
+        }
+
+        // What `status` prints can mean only one state; the first that
+        // matches it is the one shown. Two names that are the same are
+        // reported above, so they are not reported again here -- but names
+        // that differ only by quotes are different names that match alike.
+        let own = !state.matches.is_empty();
+        let mut reported: Vec<String> = Vec::new();
+        for value in state.match_values() {
+            let value = crate::v2::match_key(value);
+            if value.is_empty() || reported.contains(&value) {
+                continue;
+            }
+            let earlier = key.states[..s].iter().position(|other| {
+                (own || !other.matches.is_empty() || !same_name(other))
+                    && other
+                        .match_values()
+                        .any(|theirs| crate::v2::match_key(theirs) == value)
+            });
+            if let Some(first) = earlier {
+                out.push(
+                    Diagnostic::warning(
+                        "W0191",
+                        at(if own { "match" } else { "name" }),
+                        format!(
+                            "{value:?} is also what states[{first}] matches, so it always means states[{first}]"
+                        ),
+                    )
+                    .with_help("give each state `match` values of its own"),
+                );
+                reported.push(value);
+            }
+        }
+
+        if let Some(icon) = &state.icon {
+            icon.check(&at("icon"), out);
+        }
+        if let Some(animation) = &state.animation {
+            if animation.kind.is_ring_only() {
+                out.push(
+                    Diagnostic::error(
+                        "E0140",
+                        at("animation.kind"),
+                        format!("{:?} only works on an encoder ring", animation.kind),
+                    )
+                    .with_help("try \"pulse\", \"breathe\" or \"blink\""),
+                );
+            }
+            check_period(animation, &at("animation.period_ms"), out);
+        }
+        if let Some(action) = &state.exec {
+            check_action(action, &at("exec"), Slot::StateEntry, virtual_input, out);
+        }
     }
 }
 
@@ -1028,7 +1483,9 @@ enum Slot {
     Key,
     /// Any of a knob's gestures.
     Knob,
-    /// Neither: what a timer does when it finishes.
+    /// What a key's state runs as the key enters it.
+    StateEntry,
+    /// None of these: what a timer does when it finishes.
     Other,
 }
 
@@ -1419,7 +1876,7 @@ fn check_action(
                 SlotRule::KeyOnly => (
                     matches!(slot, Slot::KeyTap | Slot::Key),
                     "works only on a key",
-                    "it acts on the key's own timer",
+                    "it acts on the key it is bound to",
                 ),
                 SlotRule::KnobOnly => (
                     slot == Slot::Knob,
@@ -1427,7 +1884,34 @@ fn check_action(
                     "it acts on the knob it is bound to",
                 ),
             };
-            if !fits {
+            // A state's action is on a key, but it is not a gesture: it runs
+            // because the key's state changed, so one that changes it again
+            // would never stop. The daemon refuses these too, since a config
+            // with errors still loads.
+            let from_state = slot == Slot::StateEntry
+                && matches!(
+                    built_in.slot_rule(),
+                    SlotRule::KeyTapOnly | SlotRule::KeyOnly
+                );
+            if from_state {
+                out.push(
+                    Diagnostic::error(
+                        "E0189",
+                        path,
+                        format!(
+                            "{} cannot be what a state runs as the key enters it",
+                            built_in.name()
+                        ),
+                    )
+                    .with_help(match built_in.acts_on() {
+                        Some(KeyPart::States) => {
+                            "entering a state that moves the key on to another would never stop"
+                        }
+                        Some(KeyPart::Timer) => "a key with states has no timer to act on",
+                        None => "it needs a key held down, and a state's action is not one",
+                    }),
+                );
+            } else if !fits {
                 out.push(
                     Diagnostic::warning("W0127", path, format!("{} {message}", built_in.name()))
                         .with_help(help),
@@ -1683,7 +2167,7 @@ fn check_widget(
     }
     if !on_screen
         && widget.opacity.is_some()
-        && widget.background.is_none()
+        && widget.background().is_none()
         && widget.image.is_none()
     {
         out.push(Diagnostic::warning(
@@ -1692,6 +2176,16 @@ fn check_widget(
             "`opacity` is for a `background` or an `image`, and this widget has neither",
         ));
     }
+    // Its own drawing styles, checked the way a theme's are. View and
+    // opacity are checked above, in words about this widget.
+    crate::look::WidgetLook {
+        segments: widget.segments,
+        sweep: widget.sweep,
+        thickness: widget.thickness,
+        radius: widget.radius,
+        ..crate::look::WidgetLook::default()
+    }
+    .check(path, Some(kind), out);
     if (widget.warn.is_some() || widget.critical.is_some()) && !kind.is_numeric() {
         out.push(Diagnostic::warning(
             "W0178",
@@ -1763,30 +2257,7 @@ fn nearest(target: &str, candidates: &[&str]) -> String {
 
 /// Copy every field the overlay sets onto the base.
 fn overlay(base: &mut StyleLayer, over: &StyleLayer) {
-    if over.key_bg.is_some() {
-        base.key_bg = over.key_bg.clone();
-    }
-    if over.key_label_color.is_some() {
-        base.key_label_color = over.key_label_color.clone();
-    }
-    if over.key_label_size.is_some() {
-        base.key_label_size = over.key_label_size;
-    }
-    if over.key_label_strip.is_some() {
-        base.key_label_strip = over.key_label_strip;
-    }
-    if over.lcd_bg.is_some() {
-        base.lcd_bg = over.lcd_bg.clone();
-    }
-    if over.lcd_text_color.is_some() {
-        base.lcd_text_color = over.lcd_text_color.clone();
-    }
-    if over.lcd_text_size.is_some() {
-        base.lcd_text_size = over.lcd_text_size;
-    }
-    if over.ring.is_some() {
-        base.ring = over.ring.clone();
-    }
+    *base = base.over(over);
 }
 
 fn literal(value: &str) -> Option<ColorRef> {

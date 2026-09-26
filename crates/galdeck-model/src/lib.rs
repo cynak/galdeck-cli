@@ -11,22 +11,34 @@ pub mod backdrop;
 pub mod color;
 pub mod diag;
 pub mod doc;
+pub mod icon;
 pub mod keys;
+pub mod lighting;
+pub mod look;
 pub mod theme;
 pub mod v1;
 pub mod v2;
 pub mod widget;
 pub mod workspace;
 
-pub use action::{Action, BuiltIn, Invocation, Preset, RingShows, SlotRule, StepUnit, TargetKind};
+pub use action::{
+    Action, BuiltIn, Invocation, KeyPart, Preset, RingShows, SlotRule, StepUnit, TargetKind,
+};
 pub use animation::{Animation, AnimationKind};
 pub use backdrop::{Backdrop, Motion, Span};
 pub use color::{ColorRef, Palette, ResolvedPalette};
 pub use diag::{Diagnostic, Diagnostics, LineIndex, Loc, Severity};
 pub use doc::{ConfigDocument, Patch, Staged, Value};
+pub use icon::IconRef;
+pub use lighting::{Lighting, LightingEffect, ResolvedLighting};
+pub use look::{BarStyle, GraphStyle, WidgetLook, WidgetLooks};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
-pub use v2::{Global, ModeEntry, PluginBinding, Workspace, CURRENT_VERSION, MAX_MODES};
+pub use v2::{
+    status_value, Global, KeyState, ModeEntry, PluginBinding, Workspace, CURRENT_VERSION,
+    DEFAULT_STATUS_INTERVAL_MS, MAX_MODES, MAX_STATES, MAX_STATUS_LINE, MIN_STATES,
+    MIN_STATUS_INTERVAL_MS,
+};
 pub use widget::{
     parse_duration, Cells, LcdGrid, LcdTile, Level, Units, Widget, WidgetKind, WidgetView,
 };
@@ -62,8 +74,11 @@ mod tests {
         ("color.rs", include_str!("color.rs")),
         ("diag.rs", include_str!("diag.rs")),
         ("doc.rs", include_str!("doc.rs")),
+        ("icon.rs", include_str!("icon.rs")),
         ("keys.rs", include_str!("keys.rs")),
         ("lib.rs", include_str!("lib.rs")),
+        ("lighting.rs", include_str!("lighting.rs")),
+        ("look.rs", include_str!("look.rs")),
         ("theme.rs", include_str!("theme.rs")),
         ("v1.rs", include_str!("v1.rs")),
         ("v2.rs", include_str!("v2.rs")),

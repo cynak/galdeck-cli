@@ -59,6 +59,15 @@ pub enum Patch {
     },
     /// Remove one element of an array of tables.
     RemoveAt { path: String, index: usize },
+    /// Move one element of an array of tables from one place in it to
+    /// another, the rest closing up behind it: how a key's states are put
+    /// in another order. Each table keeps its comments and whatever tables
+    /// are written inside it.
+    Move {
+        path: String,
+        from: usize,
+        to: usize,
+    },
 }
 
 impl Patch {
@@ -67,7 +76,8 @@ impl Patch {
             Patch::Set { path, .. }
             | Patch::Remove { path }
             | Patch::Append { path, .. }
-            | Patch::RemoveAt { path, .. } => path,
+            | Patch::RemoveAt { path, .. }
+            | Patch::Move { path, .. } => path,
         }
     }
 }
@@ -401,6 +411,12 @@ fn apply_one(doc: &mut DocumentMut, patch: &Patch) -> Result<(), String> {
             }
             Ok(())
         }
+        Patch::Move { path, from, to } => {
+            let segments = parse_path(path)?;
+            let array = array_at(doc.as_item_mut(), &segments, false)
+                .ok_or_else(|| format!("{path:?} is not an array of tables"))?;
+            move_table(array, *from, *to)
+        }
         Patch::Remove { path } => {
             let segments = parse_path(path)?;
             let (parents, last) = segments.split_at(segments.len() - 1);
@@ -413,6 +429,90 @@ fn apply_one(doc: &mut DocumentMut, patch: &Patch) -> Result<(), String> {
                 table.remove(name);
             }
             Ok(())
+        }
+    }
+}
+
+/// Move one table of an array of tables, keeping each table whole.
+///
+/// toml_edit has no way to insert into an array of tables, so they are all
+/// taken out, put in their new order and pushed back. That alone would
+/// change nothing on disk: a parsed table is written out at the place it
+/// was read from, which it remembers. So the places the moved tables held
+/// are handed out again in their new order, each table's in the order its
+/// own were, and its comments and the tables inside it go with it.
+fn move_table(array: &mut toml_edit::ArrayOfTables, from: usize, to: usize) -> Result<(), String> {
+    let len = array.len();
+    if from >= len || to >= len {
+        return Err(format!(
+            "there are {len} tables here, so there is no moving [{from}] to [{to}]"
+        ));
+    }
+    if from == to {
+        return Ok(());
+    }
+    let mut tables: Vec<toml_edit::Table> = array.iter().cloned().collect();
+    let mut places: Vec<usize> = Vec::new();
+    for table in &tables {
+        positions(table, &mut places);
+    }
+    places.sort_unstable();
+
+    let moved = tables.remove(from);
+    tables.insert(to, moved);
+
+    let mut next = places.into_iter();
+    for table in &mut tables {
+        let mut own = Vec::new();
+        positions(table, &mut own);
+        let mut given: Vec<usize> = next.by_ref().take(own.len()).collect();
+        given.sort_unstable();
+        // Ranked, so the tables inside this one stay in the order they were
+        // written in relative to each other.
+        let mut ranked = own.clone();
+        ranked.sort_unstable();
+        let place = |old: usize| given[ranked.partition_point(|&p| p < old)];
+        reposition(table, &place);
+    }
+
+    array.clear();
+    for table in tables {
+        array.push(table);
+    }
+    Ok(())
+}
+
+/// The places a table and the tables written inside it were read from, in
+/// the order toml_edit writes them out. Tables made in memory have none, and
+/// neither do dotted keys, which are written as part of their parent.
+fn positions(table: &toml_edit::Table, out: &mut Vec<usize>) {
+    if !table.is_dotted() {
+        out.extend(table.position());
+    }
+    for (_, item) in table.iter() {
+        match item {
+            Item::Table(inner) => positions(inner, out),
+            Item::ArrayOfTables(array) => array.iter().for_each(|inner| positions(inner, out)),
+            _ => {}
+        }
+    }
+}
+
+/// Give a table and the tables inside it the places `place` maps their old
+/// ones to, visiting them as [`positions`] does.
+fn reposition(table: &mut toml_edit::Table, place: &dyn Fn(usize) -> usize) {
+    if !table.is_dotted() {
+        if let Some(old) = table.position() {
+            table.set_position(place(old));
+        }
+    }
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(inner) => reposition(inner, place),
+            Item::ArrayOfTables(array) => {
+                array.iter_mut().for_each(|inner| reposition(inner, place))
+            }
+            _ => {}
         }
     }
 }

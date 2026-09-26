@@ -58,6 +58,93 @@ impl StyleLayer {
             && self.lcd_text_size.is_none()
             && self.ring.is_none()
     }
+
+    /// This layer with `top` laid over it: every field `top` sets, and this
+    /// layer's own where it sets nothing. How a key's state restyles the key
+    /// without restating it.
+    pub fn over(&self, top: &StyleLayer) -> StyleLayer {
+        StyleLayer {
+            key_bg: top.key_bg.clone().or_else(|| self.key_bg.clone()),
+            key_label_color: top
+                .key_label_color
+                .clone()
+                .or_else(|| self.key_label_color.clone()),
+            key_label_size: top.key_label_size.or(self.key_label_size),
+            key_label_strip: top.key_label_strip.or(self.key_label_strip),
+            lcd_bg: top.lcd_bg.clone().or_else(|| self.lcd_bg.clone()),
+            lcd_text_color: top
+                .lcd_text_color
+                .clone()
+                .or_else(|| self.lcd_text_color.clone()),
+            lcd_text_size: top.lcd_text_size.or(self.lcd_text_size),
+            ring: top.ring.clone().or_else(|| self.ring.clone()),
+        }
+    }
+
+    /// Every field under the name it is written as, in the order an editor
+    /// lists them.
+    ///
+    /// Destructured without `..`, so a field added to the struct does not
+    /// compile until it is listed here too, and an editor built on this list
+    /// cannot quietly miss it.
+    pub fn fields(&self) -> [(&'static str, StyleValue<'_>); STYLE_FIELDS] {
+        let StyleLayer {
+            key_bg,
+            key_label_color,
+            key_label_size,
+            key_label_strip,
+            lcd_bg,
+            lcd_text_color,
+            lcd_text_size,
+            ring,
+        } = self;
+        [
+            ("key_bg", StyleValue::Color(key_bg.as_ref())),
+            (
+                "key_label_color",
+                StyleValue::Color(key_label_color.as_ref()),
+            ),
+            ("key_label_size", StyleValue::Size(*key_label_size)),
+            ("key_label_strip", StyleValue::Pixels(*key_label_strip)),
+            ("lcd_bg", StyleValue::Color(lcd_bg.as_ref())),
+            ("lcd_text_color", StyleValue::Color(lcd_text_color.as_ref())),
+            ("lcd_text_size", StyleValue::Size(*lcd_text_size)),
+            ("ring", StyleValue::Color(ring.as_ref())),
+        ]
+    }
+}
+
+/// How many fields a style has.
+pub const STYLE_FIELDS: usize = 8;
+
+/// One field of a [`StyleLayer`], as that layer writes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StyleValue<'a> {
+    /// `#rrggbb` or `@token`.
+    Color(Option<&'a ColorRef>),
+    /// A text size, in points.
+    Size(Option<f32>),
+    /// A length, in pixels.
+    Pixels(Option<u32>),
+}
+
+impl StyleValue<'_> {
+    /// Whether the layer says anything about this field.
+    pub fn is_set(&self) -> bool {
+        match self {
+            StyleValue::Color(color) => color.is_some(),
+            StyleValue::Size(size) => size.is_some(),
+            StyleValue::Pixels(pixels) => pixels.is_some(),
+        }
+    }
+}
+
+/// One field of a [`ResolvedStyle`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResolvedValue {
+    Color(Rgb),
+    Size(f32),
+    Pixels(u32),
 }
 
 /// A total style: no options, nothing left to decide.
@@ -113,6 +200,30 @@ impl ResolvedStyle {
         lcd_text_size: StyleSource::Builtin,
         ring: StyleSource::Builtin,
     };
+
+    /// Every field, named and ordered as [`StyleLayer::fields`] has them.
+    pub fn fields(&self) -> [(&'static str, ResolvedValue); STYLE_FIELDS] {
+        let ResolvedStyle {
+            key_bg,
+            key_label_color,
+            key_label_size,
+            key_label_strip,
+            lcd_bg,
+            lcd_text_color,
+            lcd_text_size,
+            ring,
+        } = *self;
+        [
+            ("key_bg", ResolvedValue::Color(key_bg)),
+            ("key_label_color", ResolvedValue::Color(key_label_color)),
+            ("key_label_size", ResolvedValue::Size(key_label_size)),
+            ("key_label_strip", ResolvedValue::Pixels(key_label_strip)),
+            ("lcd_bg", ResolvedValue::Color(lcd_bg)),
+            ("lcd_text_color", ResolvedValue::Color(lcd_text_color)),
+            ("lcd_text_size", ResolvedValue::Size(lcd_text_size)),
+            ("ring", ResolvedValue::Color(ring)),
+        ]
+    }
 }
 
 /// Fold a stack of layers onto the built-in defaults.
@@ -190,6 +301,15 @@ pub struct Theme {
     /// page with a background of its own replaces it.
     #[serde(default)]
     pub background: Option<crate::backdrop::Backdrop>,
+    /// The keyboard's lighting under this theme. Folded through `extends`
+    /// field by field, like the palette.
+    #[serde(default)]
+    pub lighting: Option<crate::lighting::Lighting>,
+    /// How widgets look under this theme: `[widgets]`, and
+    /// `[widgets.<kind>]` for one kind. Folded through `extends` field by
+    /// field; see [`crate::look`].
+    #[serde(default)]
+    pub widgets: Option<crate::look::WidgetLooks>,
 }
 
 /// How deep an `extends` chain may go.

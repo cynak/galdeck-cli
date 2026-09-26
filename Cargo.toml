@@ -21,7 +21,7 @@ authors = ["galdeck contributors"]
 # an unpublished framework change, add to .cargo/config.toml (not committed):
 #   [patch.crates-io]
 #   galdeck = { path = "../galdeck" }
-galdeck = "0.2.0"
+galdeck = "0.3.0"
 
 # Both a version and a path, deliberately. The path is what a local build
 # resolves; the version is what `cargo publish` substitutes, because cargo

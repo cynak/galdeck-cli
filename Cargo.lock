@@ -209,9 +209,9 @@ dependencies = [
 
 [[package]]
 name = "galdeck"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02be391f6c750bfbfda6f5193596f7c8cfe2833aa8f820e3f8759f35eb2057b9"
+checksum = "ff940561c10fdd4e6d1253ad3205abab7f2290dbc3d164c7c3e10dc3499fd28c"
 dependencies = [
  "ab_glyph",
  "hidapi",

@@ -479,7 +479,7 @@ view = "gauge"
 }
 
 #[test]
-fn only_a_clock_can_be_nixie_tubes() {
+fn a_clock_or_a_reading_can_be_nixie_tubes_but_a_date_cannot() {
     let (_, diagnostics) = load(
         r##"
 [[pages.keys]]
@@ -494,6 +494,13 @@ key = 1
 
 [pages.keys.widget]
 kind = "date"
+view = "nixie"
+
+[[pages.keys]]
+key = 2
+
+[pages.keys.widget]
+kind = "cpu"
 view = "nixie"
 "##,
     );
@@ -579,4 +586,60 @@ fn a_rainbow_goes_round_the_wheel_and_a_heartbeat_rests() {
     // Beating early in the cycle, resting late in it.
     assert!(AnimationKind::Heartbeat.mix_at(0.09) > 0.5);
     assert_eq!(AnimationKind::Heartbeat.mix_at(0.8), 0.0);
+}
+
+#[test]
+fn nixie_tubes_show_clocks_readings_and_timers_but_not_words() {
+    for kind in [
+        WidgetKind::Clock,
+        WidgetKind::Cpu,
+        WidgetKind::Temperature,
+        WidgetKind::Network,
+        WidgetKind::Timer,
+        WidgetKind::Stopwatch,
+    ] {
+        assert!(WidgetView::Nixie.suits(kind), "{kind:?}");
+    }
+    // Tubes show digits: a date's month name, the weather and what is
+    // playing have nothing a tube could light.
+    for kind in [
+        WidgetKind::Date,
+        WidgetKind::Weather,
+        WidgetKind::Media,
+        WidgetKind::Uptime,
+    ] {
+        assert!(!WidgetView::Nixie.suits(kind), "{kind:?}");
+    }
+}
+
+#[test]
+fn tubes_over_a_reading_glow_at_their_frame_rate_but_read_at_its_own_pace() {
+    use galdeck_model::Widget;
+    let cpu = Widget {
+        view: Some(WidgetView::Nixie),
+        ..Widget::of(WidgetKind::Cpu)
+    };
+    assert_eq!(cpu.interval_ms(), 100);
+    assert_eq!(
+        cpu.sample_interval_ms(),
+        WidgetKind::Cpu.default_interval_ms()
+    );
+    // An interval of its own paces the readings, never the glow.
+    let slow = Widget {
+        interval_ms: Some(5_000),
+        ..cpu
+    };
+    assert_eq!(
+        (slow.interval_ms(), slow.sample_interval_ms()),
+        (100, 5_000)
+    );
+    // A clock's reading costs nothing: it is taken on every frame.
+    let clock = Widget {
+        view: Some(WidgetView::Nixie),
+        ..Widget::of(WidgetKind::Clock)
+    };
+    assert_eq!(clock.sample_interval_ms(), clock.interval_ms());
+    // And a view that does not move reads and draws together.
+    let text = Widget::of(WidgetKind::Cpu);
+    assert_eq!(text.sample_interval_ms(), text.interval_ms());
 }

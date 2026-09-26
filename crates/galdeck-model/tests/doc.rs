@@ -256,3 +256,214 @@ fn an_edited_config_still_loads_as_a_workspace() {
     let global: galdeck_model::Global = toml::from_str(&staged.text).expect("still valid");
     assert_eq!(global.brightness, 15);
 }
+
+const STATES: &str = r##"[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+label = "Power"
+
+# Quiet, for the train.
+[[pages.keys.states]]
+name = "power-saver"
+label = "Saver"   # short, to fit
+
+# The default.
+[[pages.keys.states]]
+name = "balanced"
+style = { key_bg = "#5e81ac" }
+
+# Loud.
+[[pages.keys.states]]
+name = "performance"
+
+[[pages.keys]]
+key = 1
+label = "Next"
+"##;
+
+fn names_in_order(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("name = \""))
+        .map(|rest| rest.trim_end_matches('"'))
+        .collect()
+}
+
+fn moved(text: &str, from: usize, to: usize) -> String {
+    doc(text)
+        .preview(
+            &[Patch::Move {
+                path: "pages[0].keys[0].states".into(),
+                from,
+                to,
+            }],
+            None,
+        )
+        .expect("a valid move")
+        .text
+}
+
+#[test]
+fn moving_a_table_puts_it_in_its_new_place_with_its_comments() {
+    let text = moved(STATES, 0, 2);
+    assert_eq!(
+        names_in_order(&text),
+        ["balanced", "performance", "power-saver"]
+    );
+    // Each table's comments and trailing comments went with it.
+    let quiet = text.find("# Quiet, for the train.").unwrap();
+    let saver = text.find("name = \"power-saver\"").unwrap();
+    let loud = text.find("# Loud.").unwrap();
+    assert!(loud < quiet && quiet < saver, "{text}");
+    assert!(text.contains("label = \"Saver\"   # short, to fit"));
+    assert!(text[text.find("# The default.").unwrap()..].starts_with(
+        "# The default.\n[[pages.keys.states]]\nname = \"balanced\"\nstyle = { key_bg = \"#5e81ac\" }"
+    ));
+    // Nothing outside the array moved.
+    assert!(text.find("key = 1").unwrap() > saver);
+    assert!(text.starts_with("[[pages]]\nid = \"main\"\n\n[[pages.keys]]\nkey = 0\n"));
+}
+
+#[test]
+fn moving_a_table_back_again_restores_the_file() {
+    let there = moved(STATES, 2, 0);
+    assert_eq!(
+        names_in_order(&there),
+        ["performance", "power-saver", "balanced"]
+    );
+    assert_eq!(moved(&there, 0, 2), STATES);
+}
+
+#[test]
+fn a_moved_table_takes_the_tables_inside_it_along() {
+    let text = r##"[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+
+[[pages.keys.states]]
+name = "off"
+
+[pages.keys.states.style]
+key_bg = "#3b4252"   # grey
+
+[[pages.keys.states]]
+name = "on"
+
+[pages.keys.states.style]
+key_bg = "#a3be8c"
+"##;
+    let staged = moved(text, 1, 0);
+    assert_eq!(names_in_order(&staged), ["on", "off"]);
+    let on = staged.find("name = \"on\"").unwrap();
+    let green = staged.find("#a3be8c").unwrap();
+    let off = staged.find("name = \"off\"").unwrap();
+    let grey = staged.find("key_bg = \"#3b4252\"   # grey").unwrap();
+    assert!(on < green && green < off && off < grey, "{staged}");
+
+    // And it still reads as the same two states, in the new order.
+    let profile: toml::Value = toml::from_str(&staged).unwrap();
+    let states = profile["pages"][0]["keys"][0]["states"].as_array().unwrap();
+    assert_eq!(states[0]["name"].as_str(), Some("on"));
+    assert_eq!(states[0]["style"]["key_bg"].as_str(), Some("#a3be8c"));
+    assert_eq!(states[1]["style"]["key_bg"].as_str(), Some("#3b4252"));
+}
+
+#[test]
+fn a_move_leaves_the_key_s_own_tables_where_they_belong() {
+    // The key's style is written between two of its states, and the first
+    // state's own style after it: toml puts each under the header above it,
+    // so a move must not hand the key's table to a state or the other way.
+    let text = r##"[[pages]]
+id = "main"
+
+[[pages.keys]]
+key = 0
+
+[[pages.keys.states]]
+name = "a"
+
+[pages.keys.style]
+key_bg = "#ffffff"
+
+[pages.keys.states.style]
+key_bg = "#000000"
+
+[[pages.keys.states]]
+name = "b"
+
+[[pages.keys.states]]
+name = "c"
+
+[[pages.keys]]
+key = 1
+"##;
+    let before: toml::Value = toml::from_str(text).unwrap();
+    for (from, to) in [(0, 2), (2, 0), (1, 0), (0, 1)] {
+        let staged = moved(text, from, to);
+        let after: toml::Value = toml::from_str(&staged).expect("still valid");
+        let mut states = before["pages"][0]["keys"][0]["states"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let state = states.remove(from);
+        states.insert(to, state);
+        let keys = &after["pages"][0]["keys"];
+        assert_eq!(keys[0]["states"].as_array(), Some(&states), "{staged}");
+        assert_eq!(keys[0]["style"], before["pages"][0]["keys"][0]["style"]);
+        assert_eq!(keys[1], before["pages"][0]["keys"][1]);
+        assert_eq!(moved(&staged, to, from), text, "{from} to {to} and back");
+    }
+}
+
+#[test]
+fn a_table_added_in_the_same_edit_can_be_moved() {
+    let d = doc(STATES);
+    let staged = d
+        .preview(
+            &[
+                Patch::Append {
+                    path: "pages[0].keys[0].states".into(),
+                    fields: [("name".to_string(), Value::String("turbo".into()))].into(),
+                },
+                Patch::Move {
+                    path: "pages[0].keys[0].states".into(),
+                    from: 3,
+                    to: 0,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        names_in_order(&staged.text),
+        ["turbo", "power-saver", "balanced", "performance"]
+    );
+}
+
+#[test]
+fn a_move_to_nowhere_is_refused() {
+    let d = doc(STATES);
+    for (path, from, to) in [
+        ("pages[0].keys[0].states", 0, 3),
+        ("pages[0].keys[0].states", 5, 0),
+        ("pages[0].keys[1].states", 0, 0),
+        ("pages[0].keys[0].label", 0, 1),
+    ] {
+        let err = d
+            .preview(
+                &[Patch::Move {
+                    path: path.into(),
+                    from,
+                    to,
+                }],
+                None,
+            )
+            .expect_err("nothing to move");
+        assert!(err.iter().any(|d| d.code == "E0151"), "{path} {from} {to}");
+    }
+    // Moving a table onto itself is no change at all.
+    assert_eq!(moved(STATES, 1, 1), STATES);
+}

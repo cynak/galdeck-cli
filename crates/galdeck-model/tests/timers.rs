@@ -386,14 +386,20 @@ on_done = { keys = "ctrl+shift" }
 }
 
 #[test]
-fn a_timer_draws_as_text_a_bar_or_a_gauge_and_a_stopwatch_as_text() {
-    for view in [WidgetView::Text, WidgetView::Bar, WidgetView::Gauge] {
+fn a_timer_draws_as_text_a_bar_a_gauge_or_tubes_and_a_stopwatch_as_text_or_tubes() {
+    for view in [
+        WidgetView::Text,
+        WidgetView::Bar,
+        WidgetView::Gauge,
+        WidgetView::Nixie,
+    ] {
         assert!(view.suits(WidgetKind::Timer), "{view:?}");
     }
-    for view in [WidgetView::Graph, WidgetView::Analog, WidgetView::Nixie] {
+    for view in [WidgetView::Graph, WidgetView::Analog] {
         assert!(!view.suits(WidgetKind::Timer), "{view:?}");
     }
     assert!(WidgetView::Text.suits(WidgetKind::Stopwatch));
+    assert!(WidgetView::Nixie.suits(WidgetKind::Stopwatch));
     assert!(!WidgetView::Bar.suits(WidgetKind::Stopwatch));
     assert!(!WidgetKind::Timer.is_numeric() && !WidgetKind::Stopwatch.is_numeric());
 

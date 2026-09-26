@@ -1,34 +1,10 @@
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 // The framework directly: `detect` and `calibrate` both bypass the daemon and
 // open the module themselves.
 use galdeck::{calibrate, Font, Galleon, Layout};
-use galdeck_cli::{Args, Command};
+use galdeck_cli::{request, Args, Command};
 use galdeck_ipc::{Request, Response};
-
-fn request(request: &Request) -> Result<Response> {
-    let path = galdeck_ipc::socket_path();
-    let stream = UnixStream::connect(&path).with_context(|| {
-        format!(
-            "connecting to {} — is galdeck-daemon running? (systemctl --user start galdeck)",
-            path.display()
-        )
-    })?;
-    let mut writer = stream.try_clone()?;
-    let mut payload = serde_json::to_string(request)?;
-    payload.push('\n');
-    writer.write_all(payload.as_bytes())?;
-
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    if line.trim().is_empty() {
-        bail!("daemon closed the connection without responding");
-    }
-    Ok(serde_json::from_str(&line)?)
-}
 
 fn expect_ok(response: Response) -> Result<()> {
     match response {
@@ -255,7 +231,24 @@ fn main() -> Result<()> {
         Command::Reload => {
             expect_ok(request(&Request::Reload)?)?;
         }
-        Command::Ui => ui()?,
+        Command::Ui {
+            print,
+            open,
+            new_token,
+        } => {
+            let env = galdeck_cli::Env::current();
+            galdeck_cli::ui(
+                galdeck_cli::UiArgs {
+                    print,
+                    open,
+                    new_token,
+                },
+                &env,
+                &galdeck_ipc::socket_path(),
+                &mut |url| galdeck_cli::open_in_browser(url, &env),
+                &mut std::io::stdout(),
+            )?
+        }
         Command::Probe { size, zones } => {
             if zones {
                 expect_ok(request(&Request::ZonePattern)?)?;
@@ -285,31 +278,5 @@ fn main() -> Result<()> {
         Command::Detect => detect()?,
         Command::Calibrate { print, json, show } => calibration_ui(print, json, show)?,
     }
-    Ok(())
-}
-
-/// Print the address of the configuration UI.
-///
-/// The token lives beside the control socket, readable only by its owner, so
-/// this needs no help from the daemon -- which also means it still works when
-/// the browser tab holding the old one has gone stale.
-fn ui() -> Result<()> {
-    let socket = galdeck_ipc::socket_path();
-    let token_file = socket
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("/tmp"))
-        .join("galdeck-ui-token");
-    let token = std::fs::read_to_string(&token_file)
-        .map(|t| t.trim().to_string())
-        .with_context(|| {
-            format!(
-                "reading {} — start the daemon with --http <port> to serve the UI",
-                token_file.display()
-            )
-        })?;
-    println!("http://127.0.0.1:<port>/?token={token}");
-    println!();
-    println!("The port is the one passed to --http; the daemon prints the whole");
-    println!("address at startup.");
     Ok(())
 }

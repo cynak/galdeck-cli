@@ -222,6 +222,23 @@ pub enum Request {
     Geocode {
         name: String,
     },
+    /// A one-time code that signs a browser in to the configuration UI.
+    ///
+    /// Answered by the control socket alone, never over HTTP: the socket is
+    /// this user's and nobody else's, which is what makes a code it hands
+    /// out worth trusting. The code goes in the page's address, and the page
+    /// trades it for the token once; after that, or after the time to live,
+    /// it is worth nothing.
+    UiLogin {
+        /// How long the code stays good, in seconds, up to five minutes.
+        /// Omitted is one minute, for a browser opened straight away.
+        #[serde(default)]
+        ttl_s: Option<u32>,
+    },
+    /// Replace the UI's token with a new one and forget every code, so each
+    /// open tab has to be signed in again. Control socket only, like
+    /// `UiLogin`.
+    UiRotateToken,
     /// Draw a widget that is not in the config, with made-up readings, for
     /// an editor's gallery.
     ///
@@ -233,6 +250,31 @@ pub enum Request {
         width: u32,
         height: u32,
     },
+    /// Every theme, for an editor: each value it sets, inherits from a theme
+    /// it extends, or leaves to the built-in default, and which it is.
+    GetThemes,
+    /// Start a theme in `themes/<id>.toml`: one that extends `extends`, a
+    /// copy of the theme `copy`, or an empty one. Refused if the file is
+    /// already there.
+    CreateTheme {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        extends: Option<String>,
+        #[serde(default)]
+        copy: Option<String>,
+    },
+    /// Draw a theme with edits that are not saved, for an editor's preview.
+    ///
+    /// The patches are to the theme's own file, as `apply_config` would take
+    /// them. Nothing is written, and the drawing is made even when the edits
+    /// have problems, with whatever still resolves.
+    PreviewTheme {
+        theme: String,
+        #[serde(default)]
+        patches: Vec<Patch>,
+    },
     /// Store an image in the config directory, for a background or an icon.
     ///
     /// Base64, because the protocol is JSON. The name is reduced to a plain
@@ -241,10 +283,48 @@ pub enum Request {
         name: String,
         data: String,
     },
+    /// Download a picture from a link and store it as `SaveAsset` would.
+    ///
+    /// The daemon fetches it rather than the editor, because a page served
+    /// by the daemon may only talk to the daemon. The reply is an `Asset`.
+    FetchAsset {
+        url: String,
+    },
     /// The sound outputs and the apps playing sound on this machine right
     /// now, so an editor can offer names for a `target` and for `outputs`
     /// rather than ask for them to be typed.
     AudioTargets,
+    /// Put a key on the current page in one of its states.
+    ///
+    /// With `run`, the state's `exec` runs as a tap would run it -- "Switch
+    /// to this". Without, only what the key shows changes -- "Show this",
+    /// for when the key has got out of step with what it stands for.
+    /// Defaulted to not running anything, so a script that leaves it out
+    /// never starts a command by accident.
+    SetKeyState {
+        /// Position on the current page, 0-11.
+        key: u8,
+        state: String,
+        #[serde(default)]
+        run: bool,
+    },
+    /// The names a key's `icon` can take from the icon theme, for an
+    /// editor to offer.
+    IconNames,
+    /// Draw a key on the current page as it looks in one of its states, or
+    /// as it looks with none, for an editor's previews of each state.
+    RenderKeyState {
+        /// Position on the current page, 0-11.
+        key: u8,
+        #[serde(default)]
+        state: Option<String>,
+    },
+    /// Which of these programs are on the daemon's `PATH`, so an editor can
+    /// say what a ready-made key needs before it is put on the deck. Looked
+    /// for, never run.
+    Which {
+        names: Vec<String>,
+    },
 }
 
 /// A reply.
@@ -266,6 +346,12 @@ pub enum Response {
     Places {
         places: Vec<PlaceInfo>,
     },
+    /// Where the configuration UI is, and a one-time code for it: the page
+    /// to open is `http://127.0.0.1:{port}/?code={code}`.
+    UiLogin {
+        port: u16,
+        code: String,
+    },
     /// A picture, as a `data:` URL an `<img>` can show directly.
     Image {
         url: String,
@@ -274,6 +360,12 @@ pub enum Response {
     Asset {
         path: String,
     },
+    /// What `get_themes` found.
+    Themes {
+        themes: Vec<ThemeInfo>,
+    },
+    /// What `preview_theme` drew.
+    ThemePreview(ThemePreview),
     /// Everything an edit would produce. An empty list means it is clean.
     Diagnostics {
         diagnostics: Vec<Diagnostic>,
@@ -285,6 +377,176 @@ pub enum Response {
         #[serde(default)]
         apps: Vec<AppInfo>,
     },
+    /// What `icon_names` found, sorted.
+    IconNames {
+        #[serde(default)]
+        names: Vec<String>,
+    },
+    /// The programs `which` asked about that are there.
+    Which {
+        #[serde(default)]
+        found: Vec<String>,
+    },
+}
+
+/// A theme, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeInfo {
+    /// Its id, which is its file's name without `.toml`.
+    pub id: String,
+    /// The file it is written in, for patching: `themes/<id>.toml`.
+    pub file: String,
+    pub name: Option<String>,
+    pub extends: Option<String>,
+    /// The themes it inherits from, nearest first, as far as the chain
+    /// could be followed.
+    pub ancestors: Vec<String>,
+    /// The profiles that use it.
+    pub profiles: Vec<String>,
+    /// The themes that extend it, which change along with it.
+    pub extended_by: Vec<String>,
+    /// Every colour it can name: its own, then the ones it inherits.
+    pub palette: Vec<PaletteEntryInfo>,
+    /// Every style field, in the order an editor lists them.
+    pub style: Vec<StyleFieldInfo>,
+    /// Its background, or the nearest one it inherits. `theme` says which
+    /// theme set it.
+    pub background: Option<BackdropInfo>,
+    /// `[lighting]` as this theme writes it.
+    pub lighting: Option<LightingInfo>,
+    /// What it inherits for lighting: the themes it extends, folded
+    /// together.
+    pub inherited_lighting: Option<LightingInfo>,
+    /// `[widgets]` as this theme writes it.
+    pub widgets: Option<WidgetLooksInfo>,
+    /// What it inherits for widgets: the themes it extends, folded
+    /// together.
+    pub inherited_widgets: Option<WidgetLooksInfo>,
+}
+
+/// A `[widgets]` section, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetLooksInfo {
+    /// For every widget.
+    pub all: WidgetLookInfo,
+    /// For one kind of widget each, over `all`.
+    pub kinds: Vec<WidgetKindLookInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetKindLookInfo {
+    /// The kind, as config names it: `clock`.
+    pub kind: String,
+    pub look: WidgetLookInfo,
+}
+
+/// How widgets look, as one layer writes it. Unset fields are inherited.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetLookInfo {
+    pub view: Option<String>,
+    /// As written, which may be a `@token`.
+    pub color: Option<String>,
+    pub color_hex: Option<String>,
+    pub background: Option<String>,
+    pub background_hex: Option<String>,
+    pub opacity: Option<f32>,
+    /// `area`, `line` or `bars`.
+    pub graph: Option<String>,
+    /// `rounded`, `flat` or `segmented`.
+    pub bar: Option<String>,
+    pub segments: Option<u8>,
+    pub sweep: Option<u16>,
+    pub thickness: Option<f32>,
+    pub radius: Option<u32>,
+}
+
+/// A palette colour, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaletteEntryInfo {
+    pub name: String,
+    /// As written: `#rrggbb` or `@token`.
+    pub value: String,
+    /// What it comes to, when it resolves.
+    pub hex: Option<String>,
+    /// The theme that defines it: this one, or the one it is inherited
+    /// from.
+    pub origin: String,
+}
+
+/// A style field, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StyleFieldInfo {
+    /// Its name under `[style]`, such as `key_bg`.
+    pub field: String,
+    /// `color`, `size` (points) or `pixels`.
+    pub kind: String,
+    /// As this theme writes it, when it does.
+    pub value: Option<String>,
+    /// What it comes to: `#rrggbb` for a colour, else the number.
+    pub resolved: String,
+    /// The theme that supplies it, or `builtin`.
+    pub origin: String,
+    /// What it would come to if this theme did not set it, and where that
+    /// would come from, for an editor to say what emptying it does.
+    pub inherited: String,
+    pub inherited_origin: String,
+}
+
+/// A `[lighting]` layer, for an editor. What it leaves unset is inherited.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingInfo {
+    pub effect: Option<String>,
+    /// As written, which may be `@tokens`.
+    pub colors: Option<Vec<String>>,
+    /// Each of those resolved, in the same order; `None` where one does
+    /// not resolve.
+    pub colors_hex: Vec<Option<String>>,
+    pub speed: Option<f64>,
+    pub brightness: Option<u8>,
+    pub bar: Option<String>,
+    pub bar_hex: Option<String>,
+    /// Keys lit in a colour of their own.
+    pub keys: Vec<LightingKeyInfo>,
+}
+
+/// Keys lit in a colour of their own, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingKeyInfo {
+    /// Key names, separated by spaces, as written.
+    pub keys: String,
+    /// As written, which may be a `@token`.
+    pub color: String,
+    pub hex: Option<String>,
+}
+
+/// A theme drawn with edits that are not saved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemePreview {
+    /// Sample keys, as `data:` URLs: a label, then widgets in the theme's
+    /// look -- a gauge, a graph past its critical threshold, a bar and a
+    /// clock.
+    pub keys: Vec<String>,
+    /// The screen, as a `data:` URL.
+    pub lcd: String,
+    /// The colour a knob's ring rests at.
+    pub ring: String,
+    /// Every colour the theme can name, resolved.
+    pub palette: Vec<PaletteEntryInfo>,
+    /// The keyboard's lighting with the theme's chain folded in, when any
+    /// theme in it has some.
+    pub lighting: Option<LightingInfo>,
+    /// What is wrong with the edits. The preview is drawn anyway, from
+    /// whatever still resolves.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// A sound output, as `audio_targets` found it.
@@ -397,6 +659,11 @@ pub struct Layout {
     /// the outputs a switcher cycles through, in order.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// What is wrong with the page that only the daemon can tell, such as an
+    /// icon name no installed icon theme has, each at its place in the
+    /// config. The config's own problems are in `get_config`'s diagnostics.
+    #[serde(default)]
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// A background's settings, as configured.
@@ -460,7 +727,8 @@ pub struct KeyInfo {
     /// show its current settings rather than guess at them.
     pub widget: Option<WidgetInfo>,
     /// What tapping, holding and double-tapping do. `tap` includes a
-    /// widget's own tap (kind `implicit`) when nothing else is bound.
+    /// widget's own tap, and a key with states moving on to the next (kind
+    /// `implicit`), when nothing else is bound.
     #[serde(default)]
     pub tap: Option<ActionInfo>,
     #[serde(default)]
@@ -477,9 +745,75 @@ pub struct KeyInfo {
     pub background: String,
     /// Whether the background came from this key rather than a theme above it.
     pub background_is_own: bool,
+    /// The label colour this key resolves to, after the whole cascade; empty
+    /// from a daemon that does not say.
+    #[serde(default)]
+    pub label_color: String,
+    /// Whether the label colour came from this key rather than a theme above
+    /// it.
+    #[serde(default)]
+    pub label_color_is_own: bool,
     /// Where the key's timer or stopwatch is, when it has one.
     #[serde(default)]
     pub timer: Option<TimerInfo>,
+    /// The states the key steps through, as configured; empty for a key
+    /// without them. `label`, `icon` and `background` above stay the key's
+    /// own, which is what an editor writes back to it.
+    #[serde(default)]
+    pub states: Vec<KeyStateInfo>,
+    /// The state the key is showing, by name. `None` while it has states but
+    /// has not yet read which one it is in, when it shows its own look.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Whether `state` came from reading it with `status`, rather than from
+    /// what the key last did.
+    #[serde(default)]
+    pub state_known: bool,
+    /// The command that reads which state the key is in, as written.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// How often it is read, as written; `None` for the default.
+    #[serde(default)]
+    pub status_interval_ms: Option<u32>,
+    /// What the last read found, when there has been one.
+    #[serde(default)]
+    pub status_result: Option<StatusResultInfo>,
+}
+
+/// One of a key's states, as configured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyStateInfo {
+    pub name: String,
+    /// What `status` prints in this state, as written; empty when it is the
+    /// name. Spelt as in config, so an editor builds its patch path from it.
+    #[serde(rename = "match")]
+    pub matches: Vec<String>,
+    pub label: Option<String>,
+    pub icon: Option<String>,
+    /// What runs as the key enters this state.
+    pub exec: Option<ActionInfo>,
+    /// The state's own background and label colour, resolved through the
+    /// palette, when it sets them: what an editor saving this state starts
+    /// from, so the key's colour is never copied into it.
+    pub background: Option<String>,
+    pub label_color: Option<String>,
+    pub animation: Option<AnimationInfo>,
+}
+
+/// What reading a key's state with `status` last found.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StatusResultInfo {
+    /// The line it printed, made safe to show.
+    pub output: Option<String>,
+    /// Why it failed -- a non-zero exit, a timeout, no output -- made safe
+    /// to show. `None` when it ran.
+    pub error: Option<String>,
+    /// Whether what it printed is one of the key's states.
+    pub ok: bool,
+    /// How long ago it was read.
+    pub age_ms: u64,
 }
 
 /// A timer's or a stopwatch's count.
@@ -508,6 +842,14 @@ pub struct WidgetInfo {
     /// `text`, `graph` or `bar`, after defaulting.
     #[serde(default)]
     pub view: String,
+    /// The view the widget sets itself, if it does. `view` may instead come
+    /// from its look, and an editor must not write that one back into it.
+    #[serde(default)]
+    pub own_view: Option<String>,
+    /// The view its page, profile or theme gives widgets like it, when that
+    /// is one it can be drawn as.
+    #[serde(default)]
+    pub look_view: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -682,7 +1024,8 @@ pub struct GestureInfo {
 /// An action, taken apart for an editor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionInfo {
-    /// `shell`, `builtin`, `keys`, or `implicit` for a widget's own tap.
+    /// `shell`, `builtin`, `keys`, or `implicit` for a tap nothing is bound
+    /// to: a widget's own, or a key with states moving on to the next.
     pub kind: String,
     pub command: Option<String>,
     pub action: Option<String>,
@@ -716,7 +1059,7 @@ pub struct BuiltInInfo {
     pub takes_target: bool,
     pub needs_virtual_input: bool,
     /// Keys only: push-to-talk has to see the key come back up, and the
-    /// timer built-ins act on the key's own timer.
+    /// timer and state built-ins act on the key they are bound to.
     pub keys_only: bool,
     /// Knobs only: they act on the knob they are bound to.
     #[serde(default)]
@@ -774,6 +1117,11 @@ pub struct Capabilities {
     /// They need wpctl and pw-dump.
     #[serde(default)]
     pub mixer: String,
+    /// The desktop the daemon runs under, as `XDG_CURRENT_DESKTOP` says,
+    /// such as `ubuntu:GNOME`; empty when it does not say. For an editor to
+    /// mark what works only on one desktop.
+    #[serde(default)]
+    pub desktop: String,
 }
 
 /// A place found by name, for a weather widget.
@@ -830,6 +1178,18 @@ pub enum Event {
     ModeChanged {
         encoder: u8,
         mode: usize,
+    },
+    /// A key with states changed state, on whichever page it is: because it
+    /// was pressed, or because reading it found it had changed.
+    KeyStateChanged {
+        profile: String,
+        page: String,
+        key: u8,
+        /// `None` when it is not known which state it is in.
+        state: Option<String>,
+        /// Whether the state was read with `status`, rather than taken from
+        /// what the key last did.
+        known: bool,
     },
 }
 
