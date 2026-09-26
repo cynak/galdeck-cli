@@ -186,6 +186,10 @@ pub struct Theme {
     pub palette: Palette,
     #[serde(default)]
     pub style: StyleLayer,
+    /// A background for everything styled with this theme. A profile or a
+    /// page with a background of its own replaces it.
+    #[serde(default)]
+    pub background: Option<crate::backdrop::Backdrop>,
 }
 
 /// How deep an `extends` chain may go.

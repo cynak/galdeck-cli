@@ -45,6 +45,11 @@ pub enum AnimationKind {
     Spin,
     /// Rings only: a lit segment with a fading tail behind it.
     Comet,
+    /// Round the colour wheel. On a ring each segment is a quarter turn
+    /// ahead of the last, so the colours go round the knob.
+    Rainbow,
+    /// Two quick beats and a rest.
+    Heartbeat,
 }
 
 impl AnimationKind {
@@ -76,8 +81,21 @@ impl AnimationKind {
                     0.0
                 }
             }
-            // Rings compute their own segments; this is only a fallback.
-            AnimationKind::Spin | AnimationKind::Comet => 1.0,
+            AnimationKind::Heartbeat => {
+                // Two beats in the first half of the cycle, each a sharp
+                // rise and a slower fall, then nothing.
+                let beat = |start: f32| {
+                    let t = (phase - start) / 0.18;
+                    if (0.0..1.0).contains(&t) {
+                        (t * std::f32::consts::PI).sin().powf(0.6)
+                    } else {
+                        0.0
+                    }
+                };
+                beat(0.0).max(beat(0.22) * 0.8)
+            }
+            // These compute their own colours; this is only a fallback.
+            AnimationKind::Spin | AnimationKind::Comet | AnimationKind::Rainbow => 1.0,
         }
     }
 }
@@ -120,6 +138,8 @@ impl Animation {
         match self.kind {
             // A blink has exactly two states; more would be identical copies.
             AnimationKind::Blink => 2,
+            // A beat is sharp; eight frames blur two of them into one.
+            AnimationKind::Heartbeat => self.frames.clamp(16, MAX_FRAMES),
             _ => self.frames.clamp(MIN_FRAMES, MAX_FRAMES),
         }
     }
@@ -133,5 +153,30 @@ impl Animation {
     pub fn mix_for_frame(&self, index: u8) -> f32 {
         let phase = f32::from(index) / f32::from(self.frames());
         self.kind.mix_at(phase)
+    }
+
+    /// The colour of frame `index`, starting from `base` and moving towards
+    /// `to`. A rainbow ignores both and goes round the wheel, at `to`'s
+    /// brightness so a dark theme gets a dark rainbow.
+    pub fn color_for_frame(&self, index: u8, base: galdeck::Rgb, to: galdeck::Rgb) -> galdeck::Rgb {
+        let phase = f32::from(index) / f32::from(self.frames());
+        rainbow_or(self.kind, phase, base, to)
+    }
+}
+
+/// A rainbow's colour at `phase`, or else `base` mixed towards `to`.
+pub fn rainbow_or(
+    kind: AnimationKind,
+    phase: f32,
+    base: galdeck::Rgb,
+    to: galdeck::Rgb,
+) -> galdeck::Rgb {
+    match kind {
+        AnimationKind::Rainbow => {
+            let [r, g, b] = to.to_array();
+            let value = f32::from(r.max(g).max(b)) / 255.0;
+            galdeck::Rgb::from_hsv(phase.rem_euclid(1.0), 0.85, value.max(0.35))
+        }
+        kind => base.lerp(to, kind.mix_at(phase)),
     }
 }

@@ -10,6 +10,100 @@ use serde::{Deserialize, Serialize};
 
 pub use galdeck_model::{Diagnostic, Patch, Severity, Value};
 
+/// Which part of the deck a brightness change applies to.
+///
+/// The module itself has one brightness control for the whole panel, so the
+/// daemon accepts `All` and `LcdPanel` and refuses the encoders rather than
+/// dimming everything and reporting success. The distinction is on the wire
+/// so a future firmware that does more does not need a protocol break.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeckDevice {
+    LeftEncoder,
+    RightEncoder,
+    LcdPanel,
+    #[default]
+    All,
+}
+
+/// A rectangle in absolute panel pixels, origin top-left.
+///
+/// A plain mirror of the framework's `galdeck::layout::Rect`, redeclared here
+/// rather than re-exported: this crate is the protocol, and the daemon is free
+/// to move to a framework version whose types have shifted without that
+/// changing what goes over the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Where a calibration's numbers came from -- worth knowing before trusting
+/// them. A `Template` layout is arithmetic, not measured on any hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalSource {
+    Template,
+    File,
+    Calibrated,
+}
+
+/// One calibrated key cell, as it resolves after bands and overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalZone {
+    pub row: u8,
+    pub column: u8,
+    /// Row-major, matching the key index the device reports.
+    pub index: u8,
+    pub bounds: CalRect,
+    /// Whether these bounds came from a per-zone override rather than from
+    /// the grid. The wizard sets these when one key sits slightly off.
+    pub overridden: bool,
+}
+
+/// The calibrated geometry of this unit: where the zones actually are.
+///
+/// Carries both the editable numbers and the zones they resolve to, because
+/// deriving the second from the first means reimplementing the framework's
+/// band and override rules in JavaScript, and a drawing that disagrees with
+/// the panel is worse than no drawing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Calibration {
+    /// Where the layout file lives, so a UI can name it.
+    pub path: String,
+    pub source: CalSource,
+    /// Visible area of the info screen, above the zones.
+    pub screen: CalRect,
+    /// Outer boundary of the whole zone area.
+    pub bounds: CalRect,
+    pub rows: u8,
+    pub columns: u8,
+    /// Edge offsets applied to every cell. Zero fills the track exactly;
+    /// negative exposes bleed, positive overlaps the neighbouring track.
+    pub bleed_x: i16,
+    pub bleed_y: i16,
+    pub zones: Vec<CalZone>,
+    /// Panel dimensions, so a drawing can scale without hardcoding them.
+    pub panel_width: u16,
+    pub panel_height: u16,
+    /// Edge length of a key image on the `02 07` path.
+    ///
+    /// Sent so a drawing can show it against the measured zone rather than
+    /// hardcoding a number the framework owns. The firmware blits an image of
+    /// this size and does not scale it, so where a zone is larger the
+    /// difference is panel the key path simply cannot reach.
+    pub key_image_size: u32,
+    /// The editable text form, exactly as it is on disk.
+    pub text: String,
+    /// True while the daemon has handed the device to another process.
+    pub released: bool,
+    /// Why the saved file could not be read, when it could not. The rest of
+    /// this struct then describes the template that was used instead.
+    pub problem: Option<String>,
+}
+
 /// A request to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -18,6 +112,12 @@ pub enum Request {
     Status,
     SetBrightness {
         percent: u8,
+        /// Defaulted, so `{"cmd":"set_brightness","percent":60}` still works.
+        /// This protocol is documented as something `socat` can drive, and a
+        /// field added later must not break the scripts people wrote against
+        /// it.
+        #[serde(default)]
+        device: DeckDevice,
     },
     SwitchPage {
         name: String,
@@ -35,6 +135,22 @@ pub enum Request {
     /// `pages[0].keys[2]` in `profiles/work.toml`. Answering that here keeps
     /// the model in one place instead of reimplemented in JavaScript.
     GetLayout,
+    /// Draw a calibration pattern on every key, at a chosen pixel size.
+    ///
+    /// The protocol's report builders never check a key image's dimensions --
+    /// only its index -- so any size can be sent and the hardware's reaction
+    /// observed. That is the only way to find out what the panel really is.
+    TestPattern {
+        size: u32,
+    },
+    /// Fill every calibrated zone through the panel region path.
+    ///
+    /// The companion to `TestPattern`, and the question it answers is the
+    /// other half of the same one: that probe asks how much of a key the
+    /// firmware's key path can cover, this one asks whether the region path
+    /// can cover the rest. Each zone is drawn at its measured rectangle with
+    /// a border on its exact edge.
+    ZonePattern,
     /// Try edits without saving anything, and report what they would do.
     ///
     /// This is what makes live validation possible: the editor can show
@@ -53,6 +169,82 @@ pub enum Request {
         #[serde(default)]
         generation: Option<u64>,
     },
+    /// Close the device handle and stay closed until resumed.
+    ///
+    /// `Ok` means the hidraw handle is *gone*, not that the daemon intends to
+    /// close it: the caller opens the device the instant it reads the reply,
+    /// and two handles on one hidraw node is the leading suspect for the
+    /// module dropping off the USB bus. So the daemon holds this request open
+    /// until its io thread confirms the close.
+    ///
+    /// Idempotent, and safe to send to a daemon with no device attached --
+    /// there is nothing to wait for, and it answers at once.
+    ReleaseDevice,
+    /// Take the device back and repaint everything from the daemon's model.
+    ///
+    /// Also re-reads the calibration, because the only thing that changes it
+    /// is a wizard run, and a wizard run always ends here.
+    ResumeDevice,
+    /// The calibrated geometry of this unit.
+    GetCalibration,
+    /// Replace the calibration's grid and save it.
+    ///
+    /// Only the numbers a person can sensibly type. Measured per-row bands
+    /// and per-zone overrides are carried over, because they come from a
+    /// wizard run and are the part of a calibration that was actually
+    /// measured -- except where the edit moves the rows or columns they
+    /// describe, which invalidates them wholesale.
+    SetCalibration {
+        screen: CalRect,
+        bounds: CalRect,
+        rows: u8,
+        columns: u8,
+        bleed_x: i16,
+        bleed_y: i16,
+    },
+    /// Re-read the layout file from disk, discarding unsaved edits.
+    ReloadCalibration,
+    /// What a widget's `source` could name on this machine: sensors, cards,
+    /// interfaces, filesystems and media players that exist right now.
+    ///
+    /// So an editor can offer a list rather than ask the user to go and read
+    /// `/sys/class/hwmon` to find out that their CPU is called `k10temp`.
+    WidgetSources,
+    /// Everything the model knows how to do: built-ins, knob presets, key
+    /// names. So an editor's pickers come from one list and cannot drift.
+    Catalog,
+    /// Do something now, as a key would: an action table's fields
+    /// (`action`/`step`/`target`, `keys`, or `exec`). For an editor's "Try it".
+    RunAction {
+        fields: std::collections::BTreeMap<String, Value>,
+    },
+    /// Look a place up by name, for a weather widget.
+    Geocode {
+        name: String,
+    },
+    /// Draw a widget that is not in the config, with made-up readings, for
+    /// an editor's gallery.
+    ///
+    /// The fields are a widget table, as a patch would write them. The
+    /// readings are the same every time, so a preview shows what a widget
+    /// looks like rather than what this machine happens to be doing.
+    RenderWidget {
+        fields: std::collections::BTreeMap<String, Value>,
+        width: u32,
+        height: u32,
+    },
+    /// Store an image in the config directory, for a background or an icon.
+    ///
+    /// Base64, because the protocol is JSON. The name is reduced to a plain
+    /// file name -- no directories -- and the reply says where it went.
+    SaveAsset {
+        name: String,
+        data: String,
+    },
+    /// The sound outputs and the apps playing sound on this machine right
+    /// now, so an editor can offer names for a `target` and for `outputs`
+    /// rather than ask for them to be typed.
+    AudioTargets,
 }
 
 /// A reply.
@@ -65,11 +257,66 @@ pub enum Response {
     },
     Status(Status),
     Config(ConfigSnapshot),
-    Layout(Layout),
+    /// Boxed because a page's layout is by far the largest reply; the
+    /// encoding on the wire is the same either way.
+    Layout(Box<Layout>),
+    Calibration(Calibration),
+    WidgetSources(WidgetSources),
+    Catalog(Catalog),
+    Places {
+        places: Vec<PlaceInfo>,
+    },
+    /// A picture, as a `data:` URL an `<img>` can show directly.
+    Image {
+        url: String,
+    },
+    /// Where a saved asset was written.
+    Asset {
+        path: String,
+    },
     /// Everything an edit would produce. An empty list means it is clean.
     Diagnostics {
         diagnostics: Vec<Diagnostic>,
     },
+    /// What `audio_targets` found.
+    AudioTargets {
+        #[serde(default)]
+        outputs: Vec<OutputInfo>,
+        #[serde(default)]
+        apps: Vec<AppInfo>,
+    },
+}
+
+/// A sound output, as `audio_targets` found it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputInfo {
+    /// A short name to show: its nickname, or its description without the
+    /// part it shares with its card. Made safe to show, and at most 40
+    /// characters.
+    pub display: String,
+    /// PipeWire's name for it, which never changes while it exists.
+    pub name: String,
+    pub nick: Option<String>,
+    pub description: Option<String>,
+    /// False while it cannot play anything, such as headphones that are
+    /// unplugged. The output switcher passes over these.
+    pub usable: bool,
+    /// Whether it is where sound goes now.
+    pub default: bool,
+}
+
+/// An app with sound streams, as `audio_targets` found it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppInfo {
+    /// What a `target` should say to reach it: its program, else its name.
+    pub app: String,
+    /// Its name to show, made safe to show.
+    pub display: String,
+    pub binary: Option<String>,
+    /// Whether any of its streams is playing right now.
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +336,12 @@ pub struct Status {
     pub page: String,
     pub pages: Vec<String>,
     pub brightness: u8,
+    /// True while the device has been handed to another process, which is
+    /// why `connected` is false without the keyboard having gone anywhere.
+    #[serde(default)]
+    pub released: bool,
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 /// The whole configuration, as the files it is written in.
@@ -123,6 +376,72 @@ pub struct Layout {
     pub encoders: Vec<EncoderInfo>,
     /// Whether a `back` key would go anywhere.
     pub can_go_back: bool,
+    /// The page's text for the info screen, as configured. Not shown while
+    /// there are tiles.
+    #[serde(default)]
+    pub lcd_text: Option<String>,
+    /// Widgets laid out on the info screen, in the order they are drawn.
+    #[serde(default)]
+    pub lcd: Vec<TileInfo>,
+    /// The grid tiles are placed on, so an editor does not hard-code it.
+    #[serde(default)]
+    pub lcd_grid: Option<LcdGrid>,
+    /// `page` or `profile`: where the grid was set, when it was set at all.
+    #[serde(default)]
+    pub lcd_grid_origin: Option<String>,
+    /// The background behind this page, if there is one, and where it was
+    /// set.
+    #[serde(default)]
+    pub background: Option<BackdropInfo>,
+    /// The `outputs` list in galdeck.toml, as written, for an editor of it:
+    /// the outputs a switcher cycles through, in order.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+}
+
+/// A background's settings, as configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackdropInfo {
+    /// `page`, `profile` or `theme`: which one this came from.
+    pub origin: String,
+    /// The theme's file when it came from a theme, for an editor that
+    /// wants to say where to go and change it.
+    pub theme: Option<String>,
+    /// `lcd`, `keys` or `both`.
+    pub span: String,
+    pub image: Option<String>,
+    pub animation: Option<String>,
+    /// As configured, which may be `@tokens`.
+    pub colors: Vec<String>,
+    /// The same, resolved, for colour pickers.
+    pub colors_hex: Vec<String>,
+    pub fps: u8,
+    pub speed: f32,
+    pub dim: f32,
+}
+
+/// The info screen's layout grid.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LcdGrid {
+    pub columns: u8,
+    pub rows: u8,
+    /// The screen's size in pixels.
+    pub width: u16,
+    pub height: u16,
+}
+
+/// One widget on the info screen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TileInfo {
+    /// Index within the page's `lcd` array, for building a patch path.
+    pub index: usize,
+    pub column: u8,
+    pub row: u8,
+    pub columns: u8,
+    pub rows: u8,
+    pub widget: WidgetInfo,
+    /// What the widget last read, as text, when it has read anything.
+    pub text: Option<String>,
 }
 
 /// One configured key.
@@ -140,6 +459,14 @@ pub struct KeyInfo {
     /// The widget on this key, if any, with everything an editor needs to
     /// show its current settings rather than guess at them.
     pub widget: Option<WidgetInfo>,
+    /// What tapping, holding and double-tapping do. `tap` includes a
+    /// widget's own tap (kind `implicit`) when nothing else is bound.
+    #[serde(default)]
+    pub tap: Option<ActionInfo>,
+    #[serde(default)]
+    pub hold: Option<ActionInfo>,
+    #[serde(default)]
+    pub double: Option<ActionInfo>,
     pub animation: Option<AnimationInfo>,
     pub icon: Option<String>,
     pub exec: Option<String>,
@@ -150,6 +477,21 @@ pub struct KeyInfo {
     pub background: String,
     /// Whether the background came from this key rather than a theme above it.
     pub background_is_own: bool,
+    /// Where the key's timer or stopwatch is, when it has one.
+    #[serde(default)]
+    pub timer: Option<TimerInfo>,
+}
+
+/// A timer's or a stopwatch's count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimerInfo {
+    /// `stopped`, `running`, `paused` or `done`.
+    pub state: String,
+    /// What is left of a timer; `None` for a stopwatch.
+    pub remaining_ms: Option<u64>,
+    /// How long it has run, not counting pauses.
+    pub elapsed_ms: u64,
 }
 
 /// A widget's settings, as configured.
@@ -159,8 +501,78 @@ pub struct WidgetInfo {
     /// The interval actually in use, after clamping.
     pub interval_ms: u32,
     pub format: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
     pub command: Option<String>,
     pub placeholder: Option<String>,
+    /// `text`, `graph` or `bar`, after defaulting.
+    #[serde(default)]
+    pub view: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    /// `celsius` or `fahrenheit`, when set.
+    #[serde(default)]
+    pub units: Option<String>,
+    #[serde(default)]
+    pub place: Option<String>,
+    #[serde(default)]
+    pub warn: Option<f64>,
+    #[serde(default)]
+    pub critical: Option<f64>,
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub history: Option<u16>,
+    /// The colour as configured, which may be a `@token`.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// That colour resolved through the palette, for a colour picker.
+    #[serde(default)]
+    pub color_hex: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub background_hex: Option<String>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    #[serde(default)]
+    pub image: Option<String>,
+    /// For a timer: its length, as written.
+    #[serde(default)]
+    pub duration: Option<String>,
+    /// For a timer: what it does when it finishes.
+    #[serde(default)]
+    pub on_done: Option<ActionInfo>,
+}
+
+/// Things a widget's `source` could name, per widget kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WidgetSources {
+    pub temperature: Vec<SourceOption>,
+    pub gpu: Vec<SourceOption>,
+    pub network: Vec<SourceOption>,
+    pub disk: Vec<SourceOption>,
+    pub media: Vec<SourceOption>,
+    #[serde(default)]
+    pub battery: Vec<SourceOption>,
+    #[serde(default)]
+    pub fan: Vec<SourceOption>,
+    #[serde(default)]
+    pub volume: Vec<SourceOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceOption {
+    /// What to write in `source`.
+    pub value: String,
+    /// Something to recognise it by: a reading, a size, what is playing.
+    pub detail: Option<String>,
 }
 
 /// An animation's settings, as configured.
@@ -177,28 +589,248 @@ pub struct AnimationInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderInfo {
     pub encoder: u8,
-    pub index: usize,
+    /// Index within the page's own `encoders` array, when the page has an
+    /// entry for this knob; `None` when everything comes from further up.
+    pub index: Option<usize>,
+    /// The page entry's shell commands, as written, for older editors.
     pub press: Option<String>,
     pub cw: Option<String>,
     pub ccw: Option<String>,
     pub ring: String,
     pub ring_is_own: bool,
     pub animation: Option<AnimationInfo>,
+    /// What each gesture does once the global, profile and page layers are
+    /// folded together, each saying which layer it came from.
+    #[serde(default)]
+    pub resolved: GestureInfo,
+    /// The preset the turn came from, and what the ring shows while turning
+    /// (`output_level`, `input_level`, `deck_brightness`, `page_position`,
+    /// `profile_position`, `output_position`, `app_level`).
+    #[serde(default)]
+    pub turn_preset: Option<String>,
+    #[serde(default)]
+    pub ring_shows: Option<String>,
+    /// Each layer's own entry for this knob, as written, for editing it where
+    /// it lives. Empty for a knob set nowhere, which is still listed so an
+    /// editor shows its real colour.
+    #[serde(default)]
+    pub layers: Vec<EncoderLayerInfo>,
+    /// The ring colour before any knob layer: the theme, profile and page
+    /// styles. What a layer with no colour of its own inherits, if no layer
+    /// under it sets one.
+    #[serde(default)]
+    pub base_ring: Option<String>,
+    /// The modes the knob switches between when held, once the layers are
+    /// folded; empty without them. Each one's `ring` is where the ring
+    /// rests while it is on, resolved.
+    #[serde(default)]
+    pub modes: Vec<ModeInfo>,
+    /// Which of them is on.
+    #[serde(default)]
+    pub mode: Option<usize>,
+}
+
+/// One of a knob's modes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModeInfo {
+    /// The preset's name, as in config.
+    pub preset: String,
+    /// Its name for a person: "App volume".
+    pub title: String,
+    pub step: Option<f64>,
+    pub target: Option<String>,
+    /// A ring colour, `#rrggbb`.
+    pub ring: Option<String>,
+}
+
+/// One layer's entry for a knob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderLayerInfo {
+    /// `global`, `profile` or `page`.
+    pub layer: String,
+    /// The file it is in, and its path there, for building patches.
+    pub file: String,
+    pub path: String,
+    pub preset: Option<String>,
+    pub step: Option<f64>,
+    /// This layer's own modes, as written, with each one's own ring colour
+    /// resolved when it sets one.
+    #[serde(default)]
+    pub modes: Vec<ModeInfo>,
+    #[serde(default)]
+    pub target: Option<String>,
+    pub gestures: GestureInfo,
+    /// This layer's own ring colour and animation, resolved, if it sets
+    /// them: what an editor saving this layer starts from, so an inherited
+    /// value is never copied into it.
+    #[serde(default)]
+    pub ring: Option<String>,
+    #[serde(default)]
+    pub animation: Option<AnimationInfo>,
+}
+
+/// The gestures of a knob or key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GestureInfo {
+    pub press: Option<ActionInfo>,
+    pub cw: Option<ActionInfo>,
+    pub ccw: Option<ActionInfo>,
+    pub hold: Option<ActionInfo>,
+}
+
+/// An action, taken apart for an editor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionInfo {
+    /// `shell`, `builtin`, `keys`, or `implicit` for a widget's own tap.
+    pub kind: String,
+    pub command: Option<String>,
+    pub action: Option<String>,
+    pub keys: Option<String>,
+    pub step: Option<f64>,
+    pub target: Option<String>,
+    /// Words for a person: "volume up", "press ctrl+t".
+    pub label: String,
+    /// Which layer it came from, for a knob: `global`, `profile`, `page`.
+    pub origin: Option<String>,
+}
+
+/// Everything the model knows how to do, for an editor's pickers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Catalog {
+    pub built_ins: Vec<BuiltInInfo>,
+    pub presets: Vec<PresetInfo>,
+    pub keys: Vec<KeyNameInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltInInfo {
+    pub name: String,
+    pub group: String,
+    pub label: String,
+    /// `percent`, `seconds` or `notches`, with the default and range.
+    pub step_unit: Option<String>,
+    pub step_default: Option<f64>,
+    pub step_min: Option<f64>,
+    pub step_max: Option<f64>,
+    pub takes_target: bool,
+    pub needs_virtual_input: bool,
+    /// Keys only: push-to-talk has to see the key come back up, and the
+    /// timer built-ins act on the key's own timer.
+    pub keys_only: bool,
+    /// Knobs only: they act on the knob they are bound to.
+    #[serde(default)]
+    pub knobs_only: bool,
+    /// What `target` names for it, when it takes one: `audio_node`,
+    /// `player`, `app` or `sink`.
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    /// Whether it switches outputs or sets an app's volume, which needs
+    /// what `Capabilities::mixer` reports on.
+    #[serde(default)]
+    pub needs_mixer: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetInfo {
+    pub name: String,
+    /// Its name for a person: "Output switcher".
+    #[serde(default)]
+    pub title: String,
+    pub label: String,
+    pub press: Option<String>,
+    pub cw: Option<String>,
+    pub ccw: Option<String>,
+    pub ring_shows: Option<String>,
+    pub needs_virtual_input: bool,
+    /// What a knob's `target` names with this preset, as for a built-in;
+    /// `None` when the preset takes no target.
+    #[serde(default)]
+    pub target_kind: Option<String>,
+    /// Whether any of its gestures needs what `Capabilities::mixer` reports
+    /// on.
+    #[serde(default)]
+    pub needs_mixer: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyNameInfo {
+    pub name: String,
+    pub group: String,
+}
+
+/// What this machine lets the daemon do, so an editor can say why an action
+/// would do nothing before anyone binds it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// `ready`, `waiting` (created, settling), `unused` (nothing needs it
+    /// yet), `off` (virtual_input = false) or `unavailable: <why>`.
+    pub virtual_input: String,
+    /// `wpctl`, `pactl` or `missing`.
+    pub audio: String,
+    /// `ok` or `unavailable: <why>`.
+    pub media: String,
+    /// Output switching and per-app volume: `ok`, or `unavailable: <why>`.
+    /// They need wpctl and pw-dump.
+    #[serde(default)]
+    pub mixer: String,
+}
+
+/// A place found by name, for a weather widget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaceInfo {
+    pub label: String,
+    pub name: String,
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 /// Something that happened, for clients that asked to be told.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    DeviceConnected { firmware: String, serial: String },
+    DeviceConnected {
+        firmware: String,
+        serial: String,
+    },
     DeviceDisconnected,
-    PageChanged { profile: String, page: String },
-    ProfileChanged { profile: String },
-    BrightnessChanged { percent: u8 },
-    KeyPressed { key: u8 },
-    EncoderTurned { encoder: u8, delta: i8 },
-    EncoderPressed { encoder: u8 },
+    PageChanged {
+        profile: String,
+        page: String,
+    },
+    ProfileChanged {
+        profile: String,
+    },
+    BrightnessChanged {
+        percent: u8,
+    },
+    KeyPressed {
+        key: u8,
+    },
+    EncoderTurned {
+        encoder: u8,
+        delta: i8,
+    },
+    EncoderPressed {
+        encoder: u8,
+    },
     ConfigChanged,
+    /// The device was handed to another process, or taken back.
+    DeviceReleased,
+    DeviceResumed,
+    /// The calibration changed: re-fetch it.
+    CalibrationChanged,
+    /// A timer finished, on whichever page it is.
+    TimerDone {
+        profile: String,
+        page: String,
+        key: u8,
+    },
+    /// A knob was switched to another of its modes.
+    ModeChanged {
+        encoder: u8,
+        mode: usize,
+    },
 }
 
 /// Path of the daemon's control socket.

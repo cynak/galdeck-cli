@@ -82,7 +82,7 @@ fn a_v1_encoder_ring_becomes_a_cell_style() {
     );
     assert_eq!(style.ring, Rgb::new(0x00, 0xc8, 0x96));
     assert_eq!(
-        encoder.cw.as_deref(),
+        encoder.cw.as_ref().and_then(|cw| cw.shell()),
         Some("wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 2%+")
     );
 }

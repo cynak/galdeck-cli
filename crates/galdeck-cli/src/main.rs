@@ -2,43 +2,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
+// The framework directly: `detect` and `calibrate` both bypass the daemon and
+// open the module themselves.
+use galdeck::{calibrate, Font, Galleon, Layout};
+use galdeck_cli::{Args, Command};
 use galdeck_ipc::{Request, Response};
-
-/// Control the galdeck daemon (Corsair Galleon 100 SD Stream Deck module).
-#[derive(Parser)]
-#[command(version, about)]
-struct Args {
-    /// Control socket path (default: $GALDECK_SOCKET, else
-    /// $XDG_RUNTIME_DIR/galdeck.sock).
-    ///
-    /// Point this at a development daemon running alongside the installed one.
-    #[arg(long, global = true, value_name = "PATH")]
-    socket: Option<std::path::PathBuf>,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Check that the daemon is running.
-    Ping,
-    /// Show daemon and device state.
-    Status,
-    /// Set panel brightness (0-100).
-    Brightness { percent: u8 },
-    /// Switch to a named page in the current profile.
-    Page { name: String },
-    /// Switch to a named profile.
-    Profile { name: String },
-    /// Reload the config file and re-apply the current page.
-    Reload,
-    /// Print the configuration UI's address, token included.
-    Ui,
-    /// Enumerate the module over HID directly (works without the daemon).
-    Detect,
-}
 
 fn request(request: &Request) -> Result<Response> {
     let path = galdeck_ipc::socket_path();
@@ -123,6 +92,118 @@ fn detect() -> Result<()> {
     Ok(())
 }
 
+/// Run the calibration wizard, or read a calibration back.
+///
+/// The wizard needs the only open handle on the hidraw node -- two handles is
+/// the leading suspect for the module dropping off the USB bus -- so the
+/// device is borrowed from the daemon for the duration and handed straight
+/// back, on the error path as much as the happy one.
+fn calibration_ui(print: bool, json: bool, show: bool) -> Result<()> {
+    let path = Layout::default_path();
+    // Refining a saved calibration beats starting over. The template is the
+    // fallback rather than the default because its values are arithmetic,
+    // not measured on any unit.
+    let starting = match Layout::load(&path) {
+        Ok(layout) => {
+            eprintln!("==> loaded {}", path.display());
+            layout
+        }
+        Err(error) => {
+            eprintln!("==> no usable saved layout ({error}); starting from the template");
+            eprintln!("    NOTE: template values are arithmetic, not measured");
+            Layout::TEMPLATE
+        }
+    };
+
+    // Both of these read a calibration without touching the hardware, so they
+    // answer before the daemon is asked to give anything up. Progress has
+    // gone to stderr throughout, which leaves stdout clean enough to pipe.
+    if print {
+        print!("{}", starting.to_ascii());
+        return Ok(());
+    }
+    if json {
+        print!("{}", starting.to_json());
+        return Ok(());
+    }
+
+    // Three outcomes, and only two of them make it safe to open the device.
+    // Telling the middle one apart from the last is the whole point: a daemon
+    // built before the handover existed cannot parse this request and answers
+    // `{"result":"error","message":"bad request: ..."}` -- a perfectly
+    // successful round trip carrying a refusal. Reading that as "no daemon"
+    // and opening anyway puts a second handle on the hidraw node while the
+    // daemon still holds the first, which is the one thing this must never
+    // do, and is exactly how the module gets knocked off the USB bus.
+    let borrowed = match request(&Request::ReleaseDevice) {
+        // It let go, and confirmed the handle is closed before answering.
+        Ok(Response::Ok) => true,
+        // Something is listening on the socket and would not hand the device
+        // over. Refuse rather than race it.
+        Ok(Response::Error { message }) => bail!(
+            "the daemon would not hand the device over: {message}\n\
+             \n\
+             If that reads like a parse failure, the running daemon predates \
+             the handover and cannot be asked to let go. Update and restart \
+             it (cargo install --path crates/galdeck-daemon, then systemctl \
+             --user restart galdeck), or stop it for the duration:\n\
+             \n\
+             \x20   systemctl --user stop galdeck && galdeck calibrate; \
+             systemctl --user start galdeck"
+        ),
+        Ok(other) => bail!("unexpected reply to a device release: {other:?}"),
+        // Nothing answered, so nothing is holding the device. This is how
+        // `galdeck detect` already behaves.
+        Err(_) => {
+            eprintln!("==> no daemon holding the device; opening it directly");
+            false
+        }
+    };
+
+    // Everything that touches the device runs inside the closure, so there is
+    // exactly one place that can return early while it is still borrowed:
+    // none.
+    let outcome = (|| -> Result<Option<Layout>> {
+        let api = galdeck::hidapi::HidApi::new()?;
+        let mut deck = Galleon::open(&api)?;
+        let font = Font::system();
+
+        if show {
+            eprintln!("==> holding — press either knob to end");
+            calibrate::show(&mut deck, &starting, font.as_ref())?;
+            return Ok(None);
+        }
+
+        eprintln!("{}", calibrate::INSTRUCTIONS);
+        Ok(Some(calibrate::run(&mut deck, starting, font.as_ref())?))
+    })();
+
+    // Written before the device goes back, because ResumeDevice makes the
+    // daemon re-read the file: saving first is what makes a fresh calibration
+    // take effect without a second round trip.
+    let saved = match &outcome {
+        Ok(Some(layout)) => Some(layout.save(&path)),
+        _ => None,
+    };
+
+    // Handed back on every path, including the error one. A failure here is
+    // not worth losing a completed calibration over, but it does leave the
+    // deck dark, so it is said out loud rather than swallowed.
+    if borrowed {
+        if let Err(error) = request(&Request::ResumeDevice).and_then(expect_ok) {
+            eprintln!("==> warning: the daemon did not take the device back: {error}");
+        }
+    }
+
+    // In causal order: a wizard that failed is why nothing was saved.
+    outcome?;
+    if let Some(result) = saved {
+        result.with_context(|| format!("saving {}", path.display()))?;
+        println!("saved {}", path.display());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // Set before anything connects, and before any thread exists, so that
@@ -159,8 +240,11 @@ fn main() -> Result<()> {
             Response::Error { message } => bail!("{message}"),
             other => bail!("unexpected response: {other:?}"),
         },
-        Command::Brightness { percent } => {
-            expect_ok(request(&Request::SetBrightness { percent })?)?;
+        Command::Brightness { percent, device } => {
+            expect_ok(request(&Request::SetBrightness {
+                percent,
+                device: device.into(),
+            })?)?;
         }
         Command::Page { name } => {
             expect_ok(request(&Request::SwitchPage { name })?)?;
@@ -172,7 +256,34 @@ fn main() -> Result<()> {
             expect_ok(request(&Request::Reload)?)?;
         }
         Command::Ui => ui()?,
+        Command::Probe { size, zones } => {
+            if zones {
+                expect_ok(request(&Request::ZonePattern)?)?;
+                println!("filled every calibrated zone through the region path.");
+                println!();
+                println!("  all rows green-bordered    -> the region path reaches the whole panel");
+                println!(
+                    "  only the top row draws     -> region writes stop below the info screen"
+                );
+                println!("  borders flush with the cap -> the calibration is right");
+                println!(
+                    "  drawn, then gone a moment  -> the firmware repaints the key area itself"
+                );
+                println!();
+                println!("`galdeck reload` puts your page back.");
+            } else {
+                expect_ok(request(&Request::TestPattern { size })?)?;
+                println!("drew a {size}x{size} pattern on every key.");
+                println!();
+                println!("  border flush with the key edge  -> {size} is right");
+                println!("  something visible outside it    -> too small for the panel");
+                println!("  border clipped or a corner gone -> too large, or cropped");
+                println!();
+                println!("`galdeck reload` puts your page back.");
+            }
+        }
         Command::Detect => detect()?,
+        Command::Calibrate { print, json, show } => calibration_ui(print, json, show)?,
     }
     Ok(())
 }

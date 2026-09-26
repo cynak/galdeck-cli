@@ -15,7 +15,7 @@ use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use crate::diag::{Diagnostic, Diagnostics};
 
-/// A scalar an edit can set.
+/// A value an edit can set: a scalar, or a list of them.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Value {
@@ -23,6 +23,8 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    /// Written as an inline array, `colors = ["#88c0d0", "@accent"]`.
+    Array(Vec<Value>),
 }
 
 impl From<Value> for TomlValue {
@@ -32,6 +34,9 @@ impl From<Value> for TomlValue {
             Value::Integer(i) => TomlValue::from(i),
             Value::Float(f) => TomlValue::from(f),
             Value::Boolean(b) => TomlValue::from(b),
+            Value::Array(items) => {
+                TomlValue::Array(items.into_iter().map(TomlValue::from).collect())
+            }
         }
     }
 }

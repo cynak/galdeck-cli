@@ -31,11 +31,12 @@ installed.
 | `galdeck status` | Daemon and device state |
 | `galdeck page <name>` | Switch page within the current profile |
 | `galdeck profile <name>` | Switch profile |
-| `galdeck brightness <0-100>` | Set panel brightness |
+| `galdeck brightness <0-100> [--device …]` | Set panel brightness, for the whole deck or just `left-encoder`, `right-encoder` or `lcd-panel` |
 | `galdeck reload` | Re-read the config; a broken edit leaves the running one alone |
 | `galdeck ping` | Check the daemon is alive |
 | `galdeck ui` | Print the configuration UI's address, token included |
-| `galdeck probe [--size N]` | Draw a calibration pattern on every key to check the panel's real size |
+| `galdeck probe [--size N \| --zones]` | Draw a calibration pattern on every key to check the panel's real size, or fill every calibrated zone |
+| `galdeck calibrate [--print \| --json \| --show]` | Measure where the keys sit behind the bezel and save it (the daemon hands the device over for the run); or print, or draw, the saved layout |
 
 `--socket <path>`, or `$GALDECK_SOCKET`, points any of them at a daemon other
 than the installed one — which is what developing against `--device virtual`
@@ -52,8 +53,8 @@ file path, not a crate.
 | Crate | What it is |
 |---|---|
 | [`galdeck-cli`](crates/galdeck-cli) | The `galdeck` binary |
-| [`galdeck-ipc`](crates/galdeck-ipc) | The control protocol: line-delimited JSON over a Unix socket, one request and one response per line. Simple enough that `socat` is a usable client, which matters for something people script against |
-| [`galdeck-model`](crates/galdeck-model) | The configuration model: schema, validation diagnostics, and write-back that preserves comments and formatting |
+| [`galdeck-ipc`](crates/galdeck-ipc) | The control protocol: line-delimited JSON over a Unix socket, one request and one response per line. Simple enough that `socat` is a usable client, which matters for something people script against. Every field added since the first release has a default, so an older daemon and a newer CLI still understand each other |
+| [`galdeck-model`](crates/galdeck-model) | The configuration model: the schema (profiles, pages and themes; keys and their gestures; actions, keystrokes and knob presets, layered from `galdeck.toml` down to a page, with dial modes; widgets, timers and thresholds), validation diagnostics with stable codes, and write-back that preserves comments and formatting |
 
 `galdeck-ipc` and `galdeck-model` are published to crates.io, because the
 daemon consumes them from there. `galdeck-model` is deliberately pure — no
