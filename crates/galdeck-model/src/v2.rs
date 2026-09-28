@@ -120,6 +120,10 @@ pub struct Profile {
     /// How widgets look in this profile, over its theme's, field by field.
     #[serde(default)]
     pub widgets: Option<crate::look::WidgetLooks>,
+    /// How things move in this profile, over its theme's, a setting at a
+    /// time.
+    #[serde(default)]
+    pub motion: Option<crate::motion::MotionStyle>,
 }
 
 impl Profile {

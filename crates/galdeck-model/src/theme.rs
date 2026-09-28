@@ -310,6 +310,11 @@ pub struct Theme {
     /// field; see [`crate::look`].
     #[serde(default)]
     pub widgets: Option<crate::look::WidgetLooks>,
+    /// How things move under this theme: a key's answer to a press, an
+    /// alarm, the knob rings at rest. Folded through `extends` a setting at
+    /// a time; see [`crate::motion`].
+    #[serde(default)]
+    pub motion: Option<crate::motion::MotionStyle>,
 }
 
 /// How deep an `extends` chain may go.

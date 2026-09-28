@@ -275,6 +275,32 @@ pub enum Request {
         #[serde(default)]
         patches: Vec<Patch>,
     },
+    /// The keyboard's LEDs, for drawing it: each one's index, name, place
+    /// and group. The same for every Galleon, and answered with no keyboard
+    /// there.
+    KeyboardLayout,
+    /// What the keyboard's lighting shows this moment, while the daemon
+    /// lights it.
+    KeyboardFrame,
+    /// Draw keyboard lighting that is not saved, for an editor's preview.
+    ///
+    /// `lighting` is a `[lighting]` table as TOML. Its `@` colours resolve
+    /// against the palette of `theme`, or of the profile showing's theme when
+    /// that is left out. `presses` are keys pressed along the way, to show how
+    /// they are answered. Nothing is written, and the drawing is made even
+    /// when the lighting has problems, with whatever still resolves.
+    PreviewLighting {
+        lighting: String,
+        #[serde(default)]
+        theme: Option<String>,
+        /// How long to draw, in seconds, and at what rate.
+        #[serde(default)]
+        seconds: Option<f32>,
+        #[serde(default)]
+        fps: Option<u8>,
+        #[serde(default)]
+        presses: Vec<LightPress>,
+    },
     /// Store an image in the config directory, for a background or an icon.
     ///
     /// Base64, because the protocol is JSON. The name is reduced to a plain
@@ -364,8 +390,22 @@ pub enum Response {
     Themes {
         themes: Vec<ThemeInfo>,
     },
-    /// What `preview_theme` drew.
-    ThemePreview(ThemePreview),
+    /// What `preview_theme` drew. Boxed, like `Layout`, because it is far
+    /// larger than any other reply; the wire is the same either way.
+    ThemePreview(Box<ThemePreview>),
+    /// What `keyboard_layout` found.
+    KeyboardLayout {
+        #[serde(default)]
+        leds: Vec<LedPlace>,
+    },
+    /// What `keyboard_frame` found: `None` while the daemon is not lighting
+    /// the keyboard.
+    KeyboardFrame {
+        #[serde(default)]
+        frame: Option<String>,
+    },
+    /// What `preview_lighting` drew. Boxed, like `ThemePreview`.
+    LightingPreview(Box<LightingPreview>),
     /// Everything an edit would produce. An empty list means it is clean.
     Diagnostics {
         diagnostics: Vec<Diagnostic>,
@@ -387,6 +427,72 @@ pub enum Response {
         #[serde(default)]
         found: Vec<String>,
     },
+}
+
+/// One of the keyboard's LEDs, for drawing it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LedPlace {
+    /// Its place in a frame.
+    pub index: u8,
+    /// Its name in a config: `"W"`, `"LShift"`, `"Bar1"`.
+    pub name: String,
+    /// Its centre, in key widths from Esc's left and key heights from the
+    /// function row; the light bar is above that, so negative.
+    pub x: f32,
+    pub y: f32,
+    /// Its group's name in a config: `"letters"`, `"bar"`.
+    pub group: String,
+}
+
+/// A key pressed during a lighting preview.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightPress {
+    /// The key's name, as in a config.
+    pub key: String,
+    /// Seconds into the preview.
+    pub at: f32,
+}
+
+/// Keyboard lighting drawn for a preview.
+///
+/// Every frame, like `keyboard_frame`'s, is one `rrggbb` per LED in frame
+/// order, run together: 147 LEDs, 882 characters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingPreview {
+    pub fps: u8,
+    pub frames: Vec<String>,
+    /// What is wrong with the lighting, if anything.
+    pub diagnostics: Vec<Diagnostic>,
+    /// The lighting as it was read, for an editor to change a field of and
+    /// write back. `None` when it could not be read at all.
+    pub form: Option<LightingForm>,
+}
+
+/// A `[lighting]` table as written, field by field: what is left out is
+/// `None`, and colours are as written, `@name` or `#rrggbb`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LightingForm {
+    pub effect: Option<String>,
+    pub colors: Option<Vec<String>>,
+    pub speed: Option<f64>,
+    pub brightness: Option<u8>,
+    pub bar: Option<String>,
+    /// Key, group or `all` names, and their colour.
+    pub keys: std::collections::BTreeMap<String, String>,
+    pub reactive: Option<ReactiveForm>,
+}
+
+/// `[lighting.reactive]` as written.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReactiveForm {
+    pub effect: Option<String>,
+    pub color: Option<String>,
+    pub fade_ms: Option<u32>,
 }
 
 /// A theme, for an editor.
@@ -423,6 +529,10 @@ pub struct ThemeInfo {
     /// What it inherits for widgets: the themes it extends, folded
     /// together.
     pub inherited_widgets: Option<WidgetLooksInfo>,
+    /// `[motion]` as this theme writes it.
+    pub motion: Option<MotionInfo>,
+    /// What it inherits for motion: the themes it extends, folded together.
+    pub inherited_motion: Option<MotionInfo>,
 }
 
 /// A `[widgets]` section, for an editor.
@@ -462,6 +572,40 @@ pub struct WidgetLookInfo {
     pub sweep: Option<u16>,
     pub thickness: Option<f32>,
     pub radius: Option<u32>,
+}
+
+/// A `[motion]` section, for an editor. What it leaves unset is inherited.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionInfo {
+    pub press: Option<PressInfo>,
+    pub alarm: Option<MotionAnimationInfo>,
+    pub rings: Option<MotionAnimationInfo>,
+}
+
+/// What a key does when pressed, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PressInfo {
+    /// `none`, `flash` or `dim`.
+    pub kind: String,
+    /// As written, which may be a `@token`.
+    pub color: Option<String>,
+    pub color_hex: Option<String>,
+    /// As written.
+    pub ms: Option<u32>,
+}
+
+/// An animation in `[motion]`, for an editor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionAnimationInfo {
+    /// `pulse`, `breathe` and so on.
+    pub kind: String,
+    pub period_ms: u32,
+    /// What it moves towards, as written, which may be a `@token`.
+    pub to: Option<String>,
+    pub to_hex: Option<String>,
 }
 
 /// A palette colour, for an editor.
@@ -514,6 +658,21 @@ pub struct LightingInfo {
     pub bar_hex: Option<String>,
     /// Keys lit in a colour of their own.
     pub keys: Vec<LightingKeyInfo>,
+    /// `[lighting.reactive]`: what a press lights.
+    pub reactive: Option<ReactiveInfo>,
+}
+
+/// What a press on the keyboard lights, for an editor. Unset fields are
+/// inherited, field by field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReactiveInfo {
+    /// `ripple`, `glow` or `none`.
+    pub effect: Option<String>,
+    /// As written, which may be a `@token`.
+    pub color: Option<String>,
+    pub color_hex: Option<String>,
+    pub fade_ms: Option<u32>,
 }
 
 /// Keys lit in a colour of their own, for an editor.
@@ -544,6 +703,10 @@ pub struct ThemePreview {
     /// The keyboard's lighting with the theme's chain folded in, when any
     /// theme in it has some.
     pub lighting: Option<LightingInfo>,
+    /// How things move, with the theme's chain folded in, when any theme
+    /// in it says. A press is also drawn, as the last of `keys`: a key
+    /// mid-flash, as a picture cannot move.
+    pub motion: Option<MotionInfo>,
     /// What is wrong with the edits. The preview is drawn anyway, from
     /// whatever still resolves.
     pub diagnostics: Vec<Diagnostic>,

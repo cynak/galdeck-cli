@@ -15,6 +15,7 @@ pub mod icon;
 pub mod keys;
 pub mod lighting;
 pub mod look;
+pub mod motion;
 pub mod theme;
 pub mod v1;
 pub mod v2;
@@ -32,6 +33,7 @@ pub use doc::{ConfigDocument, Patch, Staged, Value};
 pub use icon::IconRef;
 pub use lighting::{Lighting, LightingEffect, ResolvedLighting};
 pub use look::{BarStyle, GraphStyle, WidgetLook, WidgetLooks};
+pub use motion::{MotionStyle, Press, PressKind};
 pub use theme::{ResolvedStyle, StyleLayer, StyleSource, Theme};
 pub use v1::{default_config_path, Config, EncoderConfig, KeyConfig, LoadError, Page, ParseError};
 pub use v2::{
@@ -79,6 +81,7 @@ mod tests {
         ("lib.rs", include_str!("lib.rs")),
         ("lighting.rs", include_str!("lighting.rs")),
         ("look.rs", include_str!("look.rs")),
+        ("motion.rs", include_str!("motion.rs")),
         ("theme.rs", include_str!("theme.rs")),
         ("v1.rs", include_str!("v1.rs")),
         ("v2.rs", include_str!("v2.rs")),

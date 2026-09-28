@@ -94,10 +94,12 @@ token file itself.
 |---|---|
 | [`galdeck-cli`](crates/galdeck-cli) | The `galdeck` binary |
 | [`galdeck-ipc`](crates/galdeck-ipc) | The control protocol: line-delimited JSON over a Unix socket, one request and one response per line. Simple enough that `socat` is a usable client, which matters for something people script against. Every field added since the first release has a default, so an older daemon and a newer CLI still understand each other |
-| [`galdeck-model`](crates/galdeck-model) | The configuration model: the schema (profiles, pages and themes, with their widget looks and keyboard lighting; keys and their gestures, and keys that cycle through states; icons by file or by icon-theme name; actions, keystrokes and knob presets, layered from `galdeck.toml` down to a page, with dial modes; widgets, timers and thresholds), validation diagnostics with stable codes, and write-back that preserves comments and formatting |
+| [`galdeck-model`](crates/galdeck-model) | The configuration model: the schema (profiles, pages and themes, with their widget looks, motion and keyboard lighting; keys and their gestures, and keys that cycle through states; icons by file or by icon-theme name; actions, keystrokes and knob presets, layered from `galdeck.toml` down to a page, with dial modes; widgets, timers and thresholds), validation diagnostics with stable codes, and write-back that preserves comments and formatting |
 
-`galdeck-ipc` and `galdeck-model` are published to crates.io, because the
-daemon consumes them from there. `galdeck-model` is deliberately pure — no
+`galdeck-ipc` and `galdeck-model` are not on crates.io yet. The daemon builds
+them by path from a checkout of this repository beside its own, and its CI
+checks out this repository's `main`, so what lands on `main` has to build the
+daemon too. `galdeck-model` is deliberately pure — no
 clock, no subprocesses, no sockets — so its tests can name every instant
 rather than wait for one.
 

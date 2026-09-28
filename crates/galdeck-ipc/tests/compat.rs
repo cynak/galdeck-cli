@@ -254,3 +254,29 @@ fn a_download_goes_over_the_wire_by_its_link() {
         r#"{"cmd":"fetch_asset","url":"https://a.example/play.png"}"#
     );
 }
+
+#[test]
+fn keyboard_requests_read_as_an_editor_writes_them() {
+    let layout: Request = serde_json::from_str(r#"{"cmd":"keyboard_layout"}"#).unwrap();
+    assert!(matches!(layout, Request::KeyboardLayout));
+    let preview: Request = serde_json::from_str(
+        r#"{"cmd":"preview_lighting","lighting":"effect = \"wave\"","presses":[{"key":"G","at":0.5}]}"#,
+    )
+    .unwrap();
+    let Request::PreviewLighting {
+        lighting,
+        theme,
+        seconds,
+        presses,
+        ..
+    } = preview
+    else {
+        panic!("not a preview");
+    };
+    assert_eq!(lighting, "effect = \"wave\"");
+    assert_eq!((theme, seconds), (None, None));
+    assert_eq!(presses[0].key, "G");
+    // A daemon that is not lighting the keyboard says so with no frame.
+    let quiet: Response = serde_json::from_str(r#"{"result":"keyboard_frame"}"#).unwrap();
+    assert!(matches!(quiet, Response::KeyboardFrame { frame: None }));
+}

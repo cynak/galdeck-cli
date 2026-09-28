@@ -10,6 +10,10 @@
 //! No `[lighting]` anywhere means the keyboard is left alone: the daemon never
 //! takes it over. `effect = "off"` says the same thing explicitly, which is
 //! what a profile needs to switch off its theme's lighting.
+//!
+//! `[lighting.reactive]` makes the keys answer presses over the effect, a
+//! ripple or a glow. It lights only where the keyboard's key reports can be
+//! read, which the udev rule allows as an opt-in: they are every key press.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +29,11 @@ pub const MIN_SPEED: f64 = 0.01;
 pub const MAX_SPEED: f64 = 4.0;
 pub const DEFAULT_SPEED: f64 = 0.2;
 pub const DEFAULT_BRIGHTNESS: u8 = 60;
+/// Quickest and slowest a press may fade, in milliseconds. Quicker is a
+/// flicker nobody sees; slower leaves the keyboard lit long after typing.
+pub const MIN_FADE_MS: u32 = 100;
+pub const MAX_FADE_MS: u32 = 5_000;
+pub const DEFAULT_FADE_MS: u32 = 800;
 
 /// What the keys do.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -43,6 +52,47 @@ pub enum LightingEffect {
     Spectrum,
     /// Hand the lighting back to the keyboard's own effects.
     Off,
+}
+
+/// How the keys answer presses.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactiveEffect {
+    /// A ring spreads from the pressed key across the keyboard.
+    #[default]
+    Ripple,
+    /// The pressed key flares and fades.
+    Glow,
+    /// Presses light nothing: how a profile switches off its theme's.
+    None,
+}
+
+/// `[lighting.reactive]` as written, every field optional as in `[lighting]`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reactive {
+    #[serde(default)]
+    pub effect: Option<ReactiveEffect>,
+    #[serde(default)]
+    pub color: Option<ColorRef>,
+    /// How long a press takes to fade out, in milliseconds.
+    #[serde(default)]
+    pub fade_ms: Option<u32>,
+}
+
+impl Reactive {
+    /// `above` over this layer, field by field.
+    pub fn overlay(&mut self, above: &Reactive) {
+        if above.effect.is_some() {
+            self.effect = above.effect;
+        }
+        if above.color.is_some() {
+            self.color.clone_from(&above.color);
+        }
+        if above.fade_ms.is_some() {
+            self.fade_ms = above.fade_ms;
+        }
+    }
 }
 
 /// `[lighting]` as written. Every field is optional so a layer can change
@@ -67,6 +117,9 @@ pub struct Lighting {
     /// several keys: `"w a s d" = "@red"`.
     #[serde(default)]
     pub keys: BTreeMap<String, ColorRef>,
+    /// Keys answering presses, over the effect.
+    #[serde(default)]
+    pub reactive: Option<Reactive>,
 }
 
 impl Lighting {
@@ -90,6 +143,11 @@ impl Lighting {
         }
         for (keys, color) in &above.keys {
             self.keys.insert(keys.clone(), color.clone());
+        }
+        if let Some(above) = &above.reactive {
+            self.reactive
+                .get_or_insert_with(Reactive::default)
+                .overlay(above);
         }
     }
 
@@ -133,6 +191,27 @@ impl Lighting {
                     Some((keys.clone(), rgb))
                 })
                 .collect(),
+            reactive: self.reactive.as_ref().and_then(|reactive| {
+                let effect = reactive.effect.unwrap_or_default();
+                if effect == ReactiveEffect::None {
+                    return None;
+                }
+                // An unknown colour is reported, and the keys still answer, in
+                // white, rather than going quiet with no clue why.
+                let color = reactive
+                    .color
+                    .as_ref()
+                    .and_then(|c| palette.resolve(c, &format!("{path}.reactive.color"), out))
+                    .unwrap_or(Rgb::WHITE);
+                Some(ResolvedReactive {
+                    effect,
+                    color,
+                    fade_ms: reactive
+                        .fade_ms
+                        .unwrap_or(DEFAULT_FADE_MS)
+                        .clamp(MIN_FADE_MS, MAX_FADE_MS),
+                })
+            }),
         }
     }
 
@@ -179,7 +258,26 @@ impl Lighting {
                 ));
             }
         }
+        if let Some(fade) = self.reactive.as_ref().and_then(|r| r.fade_ms) {
+            if !(MIN_FADE_MS..=MAX_FADE_MS).contains(&fade) {
+                out.push(
+                    Diagnostic::warning(
+                        "W0204",
+                        format!("{path}.reactive.fade_ms"),
+                        format!("fade_ms is clamped to {MIN_FADE_MS}-{MAX_FADE_MS}"),
+                    )
+                    .with_help(format!("got {fade}")),
+                );
+            }
+        }
     }
+}
+
+/// Said of a name in `keys`, or of a pressed key, that names no key or
+/// group. Checked where the keyboard's layout is known: by the daemon.
+pub fn unknown_key(path: impl Into<String>, name: &str) -> Diagnostic {
+    Diagnostic::warning("W0205", path, format!("no key or group is called {name:?}"))
+        .with_help("a key's name, as `W` or `LShift`; a group, as `letters` or `bar`; or `all`")
 }
 
 /// Lighting with every colour resolved and every default applied.
@@ -194,6 +292,17 @@ pub struct ResolvedLighting {
     /// Space-separated key names, and their colour. Names are checked where
     /// the keyboard's layout is known: by the daemon.
     pub keys: Vec<(String, Rgb)>,
+    /// How the keys answer presses; `None` when they do not.
+    pub reactive: Option<ResolvedReactive>,
+}
+
+/// `[lighting.reactive]` with its colour resolved and every default applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedReactive {
+    /// Never [`ReactiveEffect::None`]: that resolves to no reaction at all.
+    pub effect: ReactiveEffect,
+    pub color: Rgb,
+    pub fade_ms: u32,
 }
 
 #[cfg(test)]
@@ -269,8 +378,79 @@ mod tests {
     }
 
     #[test]
+    fn presses_ripple_in_white_unless_told_otherwise() {
+        let resolved = parse("[reactive]").resolve(
+            &ResolvedPalette::default(),
+            "lighting",
+            &mut Diagnostics::new(),
+        );
+        assert_eq!(
+            resolved.reactive,
+            Some(ResolvedReactive {
+                effect: ReactiveEffect::Ripple,
+                color: Rgb::WHITE,
+                fade_ms: DEFAULT_FADE_MS,
+            })
+        );
+        // Without the table, the keys do not answer at all.
+        let quiet = Lighting::default().resolve(
+            &ResolvedPalette::default(),
+            "lighting",
+            &mut Diagnostics::new(),
+        );
+        assert_eq!(quiet.reactive, None);
+    }
+
+    #[test]
+    fn a_profile_can_recolour_or_silence_its_themes_presses() {
+        let mut theme = parse(
+            r##"
+            [reactive]
+            effect = "glow"
+            fade_ms = 400
+            "##,
+        );
+        theme.overlay(&parse("[reactive]\ncolor = \"#ff0000\""));
+        let resolved = theme.resolve(&ResolvedPalette::default(), "l", &mut Diagnostics::new());
+        let reactive = resolved.reactive.unwrap();
+        assert_eq!(reactive.effect, ReactiveEffect::Glow);
+        assert_eq!(reactive.fade_ms, 400);
+        assert_eq!(reactive.color, Rgb::new(255, 0, 0));
+
+        theme.overlay(&parse("[reactive]\neffect = \"none\""));
+        let silenced = theme.resolve(&ResolvedPalette::default(), "l", &mut Diagnostics::new());
+        assert_eq!(silenced.reactive, None);
+    }
+
+    #[test]
+    fn a_fade_out_of_range_is_clamped_and_said_so() {
+        let lighting = parse("[reactive]\nfade_ms = 20");
+        let mut out = Diagnostics::new();
+        lighting.check("lighting", &mut out);
+        let codes: Vec<&str> = out.iter().map(|d| d.code.as_str()).collect();
+        assert_eq!(codes, ["W0204"]);
+        let resolved = lighting.resolve(&ResolvedPalette::default(), "lighting", &mut out);
+        assert_eq!(resolved.reactive.unwrap().fade_ms, MIN_FADE_MS);
+    }
+
+    #[test]
+    fn an_unknown_press_colour_is_reported_and_white_is_used() {
+        let mut out = Diagnostics::new();
+        let resolved = parse("[reactive]\ncolor = \"@nope\"").resolve(
+            &ResolvedPalette::default(),
+            "themes.t.lighting",
+            &mut out,
+        );
+        assert_eq!(resolved.reactive.unwrap().color, Rgb::WHITE);
+        assert!(out
+            .iter()
+            .any(|d| d.path.starts_with("themes.t.lighting.reactive.color")));
+    }
+
+    #[test]
     fn unknown_fields_are_refused() {
         assert!(toml::from_str::<Lighting>("colour = \"#ffffff\"").is_err());
         assert!(toml::from_str::<Lighting>("effect = \"sparkle\"").is_err());
+        assert!(toml::from_str::<Lighting>("[reactive]\nduration = 800").is_err());
     }
 }

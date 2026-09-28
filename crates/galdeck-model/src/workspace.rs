@@ -208,6 +208,7 @@ impl Workspace {
             pages,
             lighting: None,
             widgets: None,
+            motion: None,
         };
 
         Workspace {
@@ -387,6 +388,24 @@ impl Workspace {
                 ),
             kind,
         )
+    }
+
+    /// How things move in `profile`: its own `[motion]`, then its theme's,
+    /// then the themes that one extends, each setting from the nearest that
+    /// has it.
+    pub fn motion_for(&self, profile: &Profile) -> crate::motion::MotionStyle {
+        let theme = profile
+            .theme
+            .as_deref()
+            .map(|id| self.theme_chain(id))
+            .unwrap_or_default();
+        profile
+            .motion
+            .iter()
+            .chain(theme.iter().filter_map(|(_, theme)| theme.motion.as_ref()))
+            .fold(crate::motion::MotionStyle::default(), |motion, layer| {
+                motion.or(layer)
+            })
     }
 
     /// Give every widget its look; see [`crate::widget::Widget::look`].
@@ -1196,6 +1215,33 @@ impl Workspace {
                 for (field, color) in look.colors() {
                     let _ = palette.resolve(color, &format!("{at}.{field}"), &mut out);
                 }
+            }
+        }
+
+        // And `[motion]`, with its animations' periods checked as every
+        // other animation's are.
+        let themed_motion = self.themes.iter().filter_map(|(id, theme)| {
+            let motion = theme.motion.as_ref()?;
+            Some((format!("themes.{id}.motion"), motion, Some(id.as_str())))
+        });
+        let own_motion = self.profiles.iter().filter_map(|(id, profile)| {
+            let motion = profile.motion.as_ref()?;
+            Some((
+                format!("profiles.{id}.motion"),
+                motion,
+                profile.theme.as_deref(),
+            ))
+        });
+        for (path, motion, theme) in themed_motion.chain(own_motion) {
+            motion.check(&path, &mut out);
+            for (field, animation) in [("alarm", &motion.alarm), ("rings", &motion.rings)] {
+                if let Some(animation) = animation {
+                    check_period(animation, &format!("{path}.{field}.period_ms"), &mut out);
+                }
+            }
+            let (_, palette) = self.theme_for(theme, &mut Diagnostics::new());
+            for (field, color) in motion.colors() {
+                let _ = palette.resolve(color, &format!("{path}.{field}"), &mut out);
             }
         }
 

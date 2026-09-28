@@ -594,3 +594,54 @@ fn widget_looks_are_checked_where_they_are_written() {
         ["profiles.work.pages[0].keys[0].widget.thickness"]
     );
 }
+
+#[test]
+fn a_profile_moves_as_its_theme_says_unless_it_says_otherwise() {
+    use galdeck_model::{AnimationKind, PressKind};
+    let (_dir, workspace) = workspace_from(&[
+        ("galdeck.toml", GLOBAL),
+        (
+            "themes/base.toml",
+            "[motion]\nrings = { kind = \"breathe\", period_ms = 4000 }\npress = { kind = \"flash\" }\n",
+        ),
+        (
+            "themes/mine.toml",
+            "extends = \"base\"\n[motion]\nalarm = { kind = \"pulse\", period_ms = 900 }\n",
+        ),
+        (
+            "profiles/work.toml",
+            "theme = \"mine\"\n[motion]\npress = { kind = \"dim\" }\n[[pages]]\nid = \"main\"\n",
+        ),
+    ]);
+    let motion = workspace.motion_for(&workspace.profiles["work"]);
+    // The profile's own, its theme's, and what its theme extends.
+    assert_eq!(motion.press.map(|p| p.kind), Some(PressKind::Dim));
+    assert_eq!(motion.alarm.map(|a| a.kind), Some(AnimationKind::Pulse));
+    assert_eq!(motion.rings.map(|r| r.kind), Some(AnimationKind::Breathe));
+}
+
+#[test]
+fn motion_is_checked_where_it_is_written() {
+    let dir = tempdir::Dir::new();
+    dir.write("galdeck.toml", GLOBAL);
+    dir.write(
+        "themes/t.toml",
+        "[motion]\npress = { kind = \"flash\", color = \"@nope\" }\nrings = { kind = \"spin\", period_ms = 10 }\nalarm = { kind = \"comet\" }\n",
+    );
+    dir.write(
+        "profiles/work.toml",
+        "theme = \"t\"\n[[pages]]\nid = \"main\"\n",
+    );
+    let (workspace, diagnostics) = Workspace::load(dir.path());
+    assert!(workspace.is_some());
+    let at = |code: &str| {
+        diagnostics
+            .iter()
+            .filter(|d| d.code == code)
+            .map(|d| d.path.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(at("E0117"), ["themes.t.motion.press.color"]);
+    assert_eq!(at("W0141"), ["themes.t.motion.rings.period_ms"]);
+    assert_eq!(at("W0226"), ["themes.t.motion.alarm.kind"]);
+}
